@@ -4,6 +4,9 @@
  * LDPT - Logistics Distribution Planning Tool
  * 
  * RECENT OPTIMIZATIONS (for improved efficiency):
+ * - Reduced MAX_ROUTE_MILEAGE from 500 to 425 miles to keep routes well below 450 miles
+ * - Added exponential mileage penalty in route scoring to discourage high-mileage routes
+ * - Set mileage target at 85% of max (361 miles) with penalties for exceeding
  * - Reduced MAX_DISTANCE_BETWEEN_STOPS from 120 to 60 miles (hard limit 75 miles)
  *   to reduce miles between stops and create tighter routes
  * - Increased MIN_PALLETS_PER_ROUTE from 18 to 20 pallets to improve truck utilization
@@ -18,6 +21,7 @@
  * These changes aim to:
  * - Reduce unplanned trucks from 12-17 average to lower numbers
  * - Increase overall truck utilization
+ * - Keep route distances well below 450 miles (target: ~360 miles)
  * - Reduce leg distances to 50-75 miles maximum
  * - Fully utilize available carrier resources
  */
@@ -50,7 +54,7 @@ const SettingsService = {
     const properties = PropertiesService.getScriptProperties();
     const storedSettings = properties.getProperty('routingSettings');
     const defaultSettings = {
-      MAX_ROUTE_MILEAGE: 500, // 500-mile round trip cap
+      MAX_ROUTE_MILEAGE: 425, // Reduced from 500 to 425 miles to ensure routes stay well below 450
       MAX_STOPS_GENERAL: 5,
       MAX_STOPS_NY: 3,
       MAX_DISTANCE_BETWEEN_STOPS: 60, // Reduced from 120 to 60 miles for tighter routing
@@ -701,7 +705,16 @@ function setupPlanSheet() {
 
 function generateDiagnosticReport(planSheet, settings) {
   try {
-    const stats = { totalRoutes: 0, totalPallets: 0, totalMileage: 0, totalDuration: 0, hosViolations: 0, overMileage: 0, utilization: [] };
+    const stats = { 
+      totalRoutes: 0, 
+      totalPallets: 0, 
+      totalMileage: 0, 
+      totalDuration: 0, 
+      hosViolations: 0, 
+      overMileage: 0, 
+      utilization: [],
+      mileageByRoute: [] // Track individual route mileages for better analysis
+    };
     const planData = planSheet.getDataRange().getValues();
     if (!planData || planData.length <= 1) {
       Logger.log('Diagnostic: No planned routes to report.');
@@ -714,6 +727,7 @@ function generateDiagnosticReport(planSheet, settings) {
     const hosIdx = headers.indexOf('HOS Status');
     const utilIdx = headers.indexOf('Truck Utilization');
     const mileageStatusIdx = headers.indexOf('Mileage Status');
+    const routeIdIdx = headers.indexOf('Route ID');
 
     const parseNumber = (value) => {
       if (typeof value === 'number') return value;
@@ -733,23 +747,42 @@ function generateDiagnosticReport(planSheet, settings) {
       stats.totalPallets += pallets;
       const routeMiles = parseNumber(row[milesIdx]);
       stats.totalMileage += routeMiles;
+      stats.mileageByRoute.push({ routeId: row[routeIdIdx], miles: routeMiles });
       stats.totalDuration += parseNumber(row[durationIdx]);
       if (row[hosIdx] && row[hosIdx].toString().toUpperCase() !== 'OK') stats.hosViolations++;
       const mileageStatus = mileageStatusIdx !== -1 ? String(row[mileageStatusIdx] || '').toUpperCase() : '';
-      if (mileageStatus === 'OVER' || routeMiles > (settings.MAX_ROUTE_MILEAGE || 500)) stats.overMileage++;
+      if (mileageStatus === 'OVER' || routeMiles > (settings.MAX_ROUTE_MILEAGE || 425)) stats.overMileage++;
       const utilStr = String(row[utilIdx] || '');
       const utilPct = utilStr.endsWith('%') ? parseFloat(utilStr) / 100 : parseNumber(utilStr);
       if (utilPct > 0 && utilPct <= 1.5) stats.utilization.push(utilPct);
     }
+    
+    // Calculate mileage statistics
     const avgUtil = stats.utilization.length ? (stats.utilization.reduce((a,b)=>a+b,0)/stats.utilization.length) : 0;
+    const avgMileage = stats.totalRoutes ? (stats.totalMileage / stats.totalRoutes) : 0;
+    const sortedMileages = stats.mileageByRoute.map(r => r.miles).sort((a,b) => a-b);
+    const maxMileage = sortedMileages.length > 0 ? sortedMileages[sortedMileages.length - 1] : 0;
+    const minMileage = sortedMileages.length > 0 ? sortedMileages[0] : 0;
+    
     Logger.log('--- PLAN DIAGNOSTIC REPORT ---');
     Logger.log('Total Routes: ' + stats.totalRoutes);
     Logger.log('Total Pallets: ' + stats.totalPallets);
     Logger.log('Total Mileage: ' + stats.totalMileage);
     Logger.log('Avg Pallets/Truck: ' + (stats.totalRoutes ? (stats.totalPallets/stats.totalRoutes).toFixed(2) : 0));
     Logger.log('Avg Utilization: ' + (avgUtil*100).toFixed(1) + '%');
+    Logger.log('Avg Route Mileage: ' + avgMileage.toFixed(1) + ' miles');
+    Logger.log('Min Route Mileage: ' + minMileage.toFixed(1) + ' miles');
+    Logger.log('Max Route Mileage: ' + maxMileage.toFixed(1) + ' miles');
     Logger.log('Routes Over Mileage: ' + stats.overMileage);
     Logger.log('HOS Violations: ' + stats.hosViolations);
+    
+    // Log the top 5 longest routes for debugging
+    if (stats.mileageByRoute.length > 0) {
+      const topRoutes = stats.mileageByRoute.sort((a,b) => b.miles - a.miles).slice(0, 5);
+      Logger.log('Top 5 Longest Routes:');
+      topRoutes.forEach(r => Logger.log(`  ${r.routeId}: ${r.miles.toFixed(1)} miles`));
+    }
+    
     Logger.log('-----------------------------');
   } catch (e) {
     Logger.log('Error in diagnostic report: ' + e);
@@ -1285,6 +1318,12 @@ function writeRouteToSheet(route, planSheet, context) {
   const metrics = calculateRouteMetricsWithHOS(optimizedStops, warehouse, distanceMatrix, detailedDurations);
   const trailerSize = getRequiredTrailerSize(route, restrictions);
   
+  // Log warning for routes approaching or exceeding mileage limits
+  if (metrics.totalDistance > MAX_ROUTE_MILEAGE * 0.85) {
+    const stores = [...new Set(optimizedStops.map(s => s.store))].join(' -> ');
+    Logger.log(`WARNING: Route ${route.routeId} has ${metrics.totalDistance} miles (${(metrics.totalDistance/MAX_ROUTE_MILEAGE*100).toFixed(1)}% of max). Stores: ${stores}`);
+  }
+  
   let capacity = 0;
   if (route.carrier.name.includes('Unplannable') || route.carrier.name.includes('Overspill')) {
       capacity = 999;
@@ -1669,13 +1708,25 @@ function calculateRouteScore(route, context) {
   const utilization = route.totalPallets / capacity;
   // Much stronger penalty for under-utilization to push towards fuller trucks
   const utilizationPenalty = Math.pow(1 - utilization, 2) * 5000; // Increased from 2000 to 5000
+  
+  // Add penalty for high mileage routes to keep them under target
+  const MAX_ROUTE_MILEAGE = context.MAX_ROUTE_MILEAGE || 425;
+  const MILEAGE_TARGET = MAX_ROUTE_MILEAGE * 0.85; // Target 85% of max (361 miles for 425 max)
+  let mileagePenalty = 0;
+  if (metrics.totalDistance > MILEAGE_TARGET) {
+    // Exponential penalty for routes exceeding target mileage
+    const overage = metrics.totalDistance - MILEAGE_TARGET;
+    mileagePenalty = Math.pow(overage / 10, 2) * 100; // Scaled penalty
+  }
+  
   // Optional: add penalty for cluster mixing (if route.stops have >1 cluster)
   let clusterPenalty = 0;
   if (route.stops && route.stops.length > 1) {
     const clusters = new Set(route.stops.map(s => s.cluster || ''));
     if (clusters.size > 1) clusterPenalty = 800; // Increased from 500 to 800
   }
-  return totalCost + utilizationPenalty + clusterPenalty;
+  
+  return totalCost + utilizationPenalty + mileagePenalty + clusterPenalty;
 }
 
 function isRouteValid(route, context) {
