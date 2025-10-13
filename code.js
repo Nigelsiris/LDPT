@@ -29,16 +29,23 @@ const SettingsService = {
   get: function() {
     const properties = PropertiesService.getScriptProperties();
     const storedSettings = properties.getProperty('routingSettings');
-    if (storedSettings) {
-      return JSON.parse(storedSettings);
-    }
-    return {
+    const defaultSettings = {
       MAX_ROUTE_MILEAGE: 400,
       MAX_STOPS_GENERAL: 5,
       MAX_STOPS_NY: 3,
       MAX_DISTANCE_BETWEEN_STOPS: 50,
+      ABSOLUTE_MAX_DISTANCE_BETWEEN_STOPS: 75,
       MAX_ROUTE_DURATION_MINS: 720 // Note: This is pre-HOS calculation
     };
+    if (storedSettings) {
+      try {
+        const parsed = JSON.parse(storedSettings);
+        return { ...defaultSettings, ...parsed };
+      } catch (e) {
+        Logger.log(`Warning: Failed to parse stored routing settings: ${e}`);
+      }
+    }
+    return defaultSettings;
   },
   save: function(settings) {
     const properties = PropertiesService.getScriptProperties();
@@ -695,7 +702,16 @@ function findBestInitialCarrier(shipment, carriers, context) {
 }
 
 function checkAndScoreInsertion(shipment, route, context, log, iter) {
-  const { restrictions, distanceMatrix, warehouse, OVERPLAN_FACTOR, MAX_ROUTE_MILEAGE, MAX_STOPS_GENERAL, MAX_DISTANCE_BETWEEN_STOPS } = context;
+  const {
+    restrictions,
+    distanceMatrix,
+    warehouse,
+    OVERPLAN_FACTOR,
+    MAX_ROUTE_MILEAGE,
+    MAX_STOPS_GENERAL,
+    MAX_DISTANCE_BETWEEN_STOPS,
+    ABSOLUTE_MAX_DISTANCE_BETWEEN_STOPS
+  } = context;
 
   // Validate input parameters
   if (!shipment || !route || !context || !distanceMatrix || !warehouse) {
@@ -705,12 +721,9 @@ function checkAndScoreInsertion(shipment, route, context, log, iter) {
 
   const tempStops = [...route.stops, shipment];
   if ([...new Set(tempStops.map(s => s.store))].length > MAX_STOPS_GENERAL) return null;
-  
-  const firstStopDistance = getDistanceFromFirstStop(tempStops, distanceMatrix);
-  if (firstStopDistance === null || firstStopDistance > MAX_DISTANCE_BETWEEN_STOPS) return null;
-  
+
   if (!isTempCompatible(new Set(tempStops.map(s => s.category)))) return null;
-  
+
   if (restrictions[shipment.store] && restrictions[shipment.store].deliveryWindow && restrictions[shipment.store].deliveryWindow.trim() !== '' && restrictions[shipment.store].deliveryWindow.toUpperCase() !== 'N/A' && !isTimeInWindow(route.time, restrictions[shipment.store].deliveryWindow)) return null;
 
   const carrier = route.carrier;
@@ -725,16 +738,32 @@ function checkAndScoreInsertion(shipment, route, context, log, iter) {
   
   if (!capacity || (route.totalPallets || 0) + shipment.pallets > (capacity * OVERPLAN_FACTOR)) return null;
 
+  const currentOptimized = advancedOptimizeStopOrder(route.stops, warehouse, distanceMatrix);
   const tempOptimized = advancedOptimizeStopOrder(tempStops, warehouse, distanceMatrix);
+  const preferredLegThreshold = MAX_DISTANCE_BETWEEN_STOPS || 50;
+  const hardLegLimit = ABSOLUTE_MAX_DISTANCE_BETWEEN_STOPS || Math.max(75, preferredLegThreshold);
+
+  const currentLegDetails = getLegDistanceDetails(currentOptimized, distanceMatrix);
+  if (currentLegDetails.hasMissingData) return null;
+
+  const proposedLegDetails = getLegDistanceDetails(tempOptimized, distanceMatrix);
+  if (proposedLegDetails.hasMissingData) return null;
+
+  const proposedMaxLeg = proposedLegDetails.legDistances.length > 0 ? Math.max(...proposedLegDetails.legDistances) : 0;
+  if (proposedMaxLeg > hardLegLimit) return null;
+
+  const distancePenaltyDelta = calculateDistancePenalty(proposedLegDetails.legDistances, preferredLegThreshold)
+    - calculateDistancePenalty(currentLegDetails.legDistances, preferredLegThreshold);
+
   const tempMetrics = calculateRouteMetricsWithHOS(tempOptimized, warehouse, distanceMatrix, context.detailedDurations);
   if (tempMetrics.totalDistance > MAX_ROUTE_MILEAGE || tempMetrics.hosStatus !== 'OK') return null;
 
-  const originalMetrics = calculateRouteMetricsWithHOS(advancedOptimizeStopOrder(route.stops, warehouse, distanceMatrix), warehouse, distanceMatrix, context.detailedDurations);
-  
+  const originalMetrics = calculateRouteMetricsWithHOS(currentOptimized, warehouse, distanceMatrix, context.detailedDurations);
+
   const newCost = (tempMetrics.totalDistance * carrier.costPerMile) + carrier.costPerRoute;
   const oldCost = (originalMetrics.totalDistance * carrier.costPerMile) + carrier.costPerRoute;
 
-  return newCost - oldCost; // Return the change in cost
+  return (newCost - oldCost) + distancePenaltyDelta; // Return cost delta adjusted for leg distance penalties
 }
 
 function planRemainingShipments(shipments, context, planSheet) {
@@ -869,34 +898,45 @@ function getRequiredTrailerSize(route, restrictions) {
   return '53';
 }
 
-function getDistanceFromFirstStop(stops, distanceMatrix) {
-  if (!stops || !distanceMatrix || stops.length < 2) return 0;
-  
-  let maxDist = 0;
-  const firstStopId = stops[0].store;
-  
-  if (!firstStopId || !distanceMatrix[firstStopId]) {
-    Logger.log(`Warning: Missing distance data for first stop ${firstStopId}`);
-    return null;
+function getLegDistanceDetails(stops, distanceMatrix) {
+  if (!stops || !distanceMatrix || stops.length === 0) {
+    return { legDistances: [], hasMissingData: false };
   }
-  
-  for (let i = 1; i < stops.length; i++) {
-    const currentStore = stops[i].store;
-    if (!currentStore) {
-      Logger.log(`Warning: Invalid store ID at index ${i}`);
-      continue;
-    }
-    
-    const leg = distanceMatrix[firstStopId][currentStore];
+
+  const uniqueStores = [...new Set(stops.map(s => s.store))];
+  if (uniqueStores.length < 2) {
+    return { legDistances: [], hasMissingData: false };
+  }
+
+  const legDistances = [];
+  for (let i = 1; i < uniqueStores.length; i++) {
+    const from = uniqueStores[i - 1];
+    const to = uniqueStores[i];
+    if (!from || !to) continue;
+
+    const forwardLeg = distanceMatrix[from] && distanceMatrix[from][to];
+    const reverseLeg = distanceMatrix[to] && distanceMatrix[to][from];
+    const leg = forwardLeg || reverseLeg;
+
     if (!leg) {
-      Logger.log(`Warning: Missing distance data between ${firstStopId} and ${currentStore}`);
-      continue;
+      Logger.log(`Warning: Missing distance data between ${from} and ${to}`);
+      return { legDistances: [], hasMissingData: true };
     }
-    
-    if (leg.distance > maxDist) maxDist = leg.distance;
+
+    legDistances.push(leg.distance);
   }
-  
-  return maxDist;
+
+  return { legDistances, hasMissingData: false };
+}
+
+function calculateDistancePenalty(legDistances, preferredThreshold) {
+  if (!legDistances || legDistances.length === 0) return 0;
+  const threshold = preferredThreshold || 0;
+  return legDistances.reduce((penalty, distance) => {
+    if (distance <= threshold) return penalty;
+    const overage = distance - threshold;
+    return penalty + (overage * overage);
+  }, 0);
 }
 
 function formatDetailedRoute(orderedStops, warehouse, distanceMatrix) {
