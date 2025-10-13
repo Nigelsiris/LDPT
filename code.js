@@ -75,16 +75,18 @@ function getCarrierCosts() {
   }
   const costs = {};
   const headers = values[0];
-  const carrierIdx = headers.indexOf('Carrier');
-  const costPerMileIdx = headers.indexOf('Cost Per Mile');
-  const costPerRouteIdx = headers.indexOf('Cost Per Route');
+  const carrierIdx = 0; // Column A
+  const costPerMileIdx = 1; // Column B
+  const costPerRouteIdx = 2; // Column C
+  const costNotToUseIdx = 3; // Column D
 
   values.slice(1).forEach(row => {
     const carrierName = String(row[carrierIdx] || '').trim();
     if (carrierName) {
       costs[carrierName] = {
         costPerMile: parseFloat(row[costPerMileIdx]) || 0,
-        costPerRoute: parseFloat(row[costPerRouteIdx]) || 0
+        costPerRoute: parseFloat(row[costPerRouteIdx]) || 0,
+        costNotToUse: parseFloat(row[costNotToUseIdx]) || 0
       };
     }
   });
@@ -97,6 +99,7 @@ function getCarrierCosts() {
  * @returns {Array<object>} An array of carrier objects with capacities and costs.
  */
 function getCarriers() {
+  Logger.log('Starting to fetch carrier data...');
   const values = getSheetData('Carriers_2');
   if (!values || values.length <= 1) {
     Logger.log("Warning: 'Carriers_2' sheet is empty or has no data.");
@@ -115,14 +118,17 @@ function getCarriers() {
     if (!carrierName) continue;
 
     if (!carriers[carrierName]) {
-      const costs = carrierCosts[carrierName] || { costPerMile: 0, costPerRoute: 0 };
+      const costs = carrierCosts[carrierName] || { costPerMile: 0, costPerRoute: 0, costNotToUse: 0 };
+      Logger.log(`Carrier ${carrierName} costs: ${JSON.stringify(costs)}`);
       carriers[carrierName] = {
         name: carrierName,
         timeSlots: [],
         pallets36: palletCapacities[carrierName]?.pallets36 || 18,
         pallets48: palletCapacities[carrierName]?.pallets48 || 22,
         pallets53: palletCapacities[carrierName]?.pallets53 || 26,
-        ...costs // Merge cost data into the carrier object
+        costPerMile: costs.costPerMile,
+        costPerRoute: costs.costPerRoute,
+        costNotToUse: costs.costNotToUse
       };
     }
 
@@ -226,12 +232,19 @@ function getDistanceMatrix(shipments, addressData, warehouseLocation, apiKey) {
   const matrix = {};
   const sheetData = getSheetData('Distance Matrix');
   
+  Logger.log('Starting to build distance matrix...');
+  
   if (sheetData && sheetData.length > 1) {
     const headers = sheetData[0];
     const fromIndex = headers.indexOf('From');
     const toIndex = headers.indexOf('To');
     const distIndex = headers.indexOf('Distance (M)');
     const durIndex = headers.indexOf('Duration (Min)');
+
+    if (fromIndex === -1 || toIndex === -1 || distIndex === -1 || durIndex === -1) {
+      Logger.log('Error: Missing required columns in Distance Matrix sheet');
+      throw new Error('Distance Matrix sheet missing required columns');
+    }
 
     for (let i = 1; i < sheetData.length; i++) {
       const row = sheetData[i];
@@ -441,12 +454,26 @@ function generatePlan() {
   
   let shipments, allCarriers, restrictions, detailedDurations, addressData, distanceMatrix;
   try {
+    Logger.log('Starting data collection...');
     const productTypeMap = getProductTypeMap();
+    Logger.log('Got product type map');
+    
     shipments = getShipments(productTypeMap);
+    Logger.log(`Got ${shipments.length} shipments`);
+    
     allCarriers = getCarriers();
+    Logger.log(`Got ${allCarriers.length} carriers`);
+    
     restrictions = getRestrictions();
+    Logger.log('Got restrictions');
+    
     detailedDurations = getDetailedDurations();
+    Logger.log('Got detailed durations');
+    
     addressData = getAddressData();
+    Logger.log('Got address data');
+    
+    Logger.log('Starting distance matrix calculation...');
     distanceMatrix = getDistanceMatrix(shipments, addressData, WAREHOUSE_LOCATION, API_KEY);
     shipments.forEach(s => s.cluster = (addressData[s.store] && addressData[s.store].cluster) || 'Others');
   } catch (e) {
@@ -516,6 +543,7 @@ function runPlanningLoop(shipmentsToPlan, availableCarriers, context, planSheet,
     let unassignedShipments = [...shipmentsToPlan];
     let iteration = startIteration;
     const { MAX_PLANNING_ATTEMPTS, MIN_PALLETS_PER_ROUTE, restrictions } = context;
+    let routes = []; // Track all created routes for rebalancing
 
     let planningInProgress = true;
     while (planningInProgress) {
@@ -524,6 +552,13 @@ function runPlanningLoop(shipmentsToPlan, availableCarriers, context, planSheet,
         let seedIndex = unassignedShipments.findIndex(s => s.attempts < MAX_PLANNING_ATTEMPTS && !s.failureReason);
         
         if (seedIndex === -1) {
+            // Try rebalancing routes before finishing
+            if (routes.length > 0) {
+                rebalanceRoutes(routes, context);
+                routes.forEach(route => {
+                    writeRouteToSheet(route, planSheet, context);
+                });
+            }
             planningInProgress = false;
             continue;
         }
@@ -580,11 +615,14 @@ function runPlanningLoop(shipmentsToPlan, availableCarriers, context, planSheet,
         } else {
             bestRouteOption.timeSlot.used++;
             currentRoute.routeId = `${currentRoute.carrier.name.replace(/\s+/g, '')}_${iteration++}`;
-            writeRouteToSheet(currentRoute, planSheet, context);
+            routes.push(currentRoute); // Add to routes array instead of writing immediately
         }
     }
     
-    return { remainingShipments: unassignedShipments, iteration };
+    // After main loop, try to utilize any remaining carriers with pull-forward requests
+    const { remainingShipments: finalUnassigned } = utilizePullForwardRequests(unassignedShipments, availableCarriers, context, routes);
+    
+    return { remainingShipments: finalUnassigned, iteration };
 }
 
 function findBestInitialCarrier(shipment, carriers, context) {
@@ -613,9 +651,18 @@ function findBestInitialCarrier(shipment, carriers, context) {
 function checkAndScoreInsertion(shipment, route, context, log, iter) {
   const { restrictions, distanceMatrix, warehouse, OVERPLAN_FACTOR, MAX_ROUTE_MILEAGE, MAX_STOPS_GENERAL, MAX_DISTANCE_BETWEEN_STOPS } = context;
 
+  // Validate input parameters
+  if (!shipment || !route || !context || !distanceMatrix || !warehouse) {
+    Logger.log('Error: Missing required parameters in checkAndScoreInsertion');
+    return null;
+  }
+
   const tempStops = [...route.stops, shipment];
   if ([...new Set(tempStops.map(s => s.store))].length > MAX_STOPS_GENERAL) return null;
-  if (getDistanceFromFirstStop(tempStops, distanceMatrix) > MAX_DISTANCE_BETWEEN_STOPS) return null;
+  
+  const firstStopDistance = getDistanceFromFirstStop(tempStops, distanceMatrix);
+  if (firstStopDistance === null || firstStopDistance > MAX_DISTANCE_BETWEEN_STOPS) return null;
+  
   if (!isTempCompatible(new Set(tempStops.map(s => s.category)))) return null;
   
   if (restrictions[shipment.store] && restrictions[shipment.store].deliveryWindow && restrictions[shipment.store].deliveryWindow.trim() !== '' && restrictions[shipment.store].deliveryWindow.toUpperCase() !== 'N/A' && !isTimeInWindow(route.time, restrictions[shipment.store].deliveryWindow)) return null;
@@ -650,10 +697,34 @@ function planRemainingShipments(shipments, context, planSheet) {
   const overspillShipments = shipments.filter(s => !s.failureReason);
 
   if (unplannableTime.length > 0) {
-    writeRouteToSheet({ carrier: { name: 'Unplannable (Time)' }, routeId: 'Time_1', stops: unplannableTime, totalPallets: unplannableTime.reduce((s, p) => s + p.pallets, 0), cluster: 'Manual Review', notes: 'Failed due to delivery window constraints.' }, planSheet, context);
+    writeRouteToSheet({ 
+      carrier: { 
+        name: 'Unplannable (Time)', 
+        costPerMile: 0, 
+        costPerRoute: 0, 
+        costNotToUse: 0 
+      }, 
+      routeId: 'Time_1', 
+      stops: unplannableTime, 
+      totalPallets: unplannableTime.reduce((s, p) => s + p.pallets, 0), 
+      cluster: 'Manual Review', 
+      notes: 'Failed due to delivery window constraints.' 
+    }, planSheet, context);
   }
   if (unplannableOther.length > 0) {
-    writeRouteToSheet({ carrier: { name: 'Unplannable (Other)' }, routeId: 'Other_1', stops: unplannableOther, totalPallets: unplannableOther.reduce((s, p) => s + p.pallets, 0), cluster: 'Manual Review', notes: 'Failed planning after max attempts or no viable carrier.' }, planSheet, context);
+    writeRouteToSheet({ 
+      carrier: { 
+        name: 'Unplannable (Other)', 
+        costPerMile: 0, 
+        costPerRoute: 0, 
+        costNotToUse: 0 
+      }, 
+      routeId: 'Other_1', 
+      stops: unplannableOther, 
+      totalPallets: unplannableOther.reduce((s, p) => s + p.pallets, 0), 
+      cluster: 'Manual Review', 
+      notes: 'Failed planning after max attempts or no viable carrier.' 
+    }, planSheet, context);
   }
   
   if (overspillShipments.length === 0) return;
@@ -753,13 +824,32 @@ function getRequiredTrailerSize(route, restrictions) {
 }
 
 function getDistanceFromFirstStop(stops, distanceMatrix) {
-  if (stops.length < 2) return 0;
+  if (!stops || !distanceMatrix || stops.length < 2) return 0;
+  
   let maxDist = 0;
   const firstStopId = stops[0].store;
-  for (let i = 1; i < stops.length; i++) {
-    const leg = (distanceMatrix[firstStopId] && distanceMatrix[firstStopId][stops[i].store]);
-    if (leg && leg.distance > maxDist) maxDist = leg.distance;
+  
+  if (!firstStopId || !distanceMatrix[firstStopId]) {
+    Logger.log(`Warning: Missing distance data for first stop ${firstStopId}`);
+    return null;
   }
+  
+  for (let i = 1; i < stops.length; i++) {
+    const currentStore = stops[i].store;
+    if (!currentStore) {
+      Logger.log(`Warning: Invalid store ID at index ${i}`);
+      continue;
+    }
+    
+    const leg = distanceMatrix[firstStopId][currentStore];
+    if (!leg) {
+      Logger.log(`Warning: Missing distance data between ${firstStopId} and ${currentStore}`);
+      continue;
+    }
+    
+    if (leg.distance > maxDist) maxDist = leg.distance;
+  }
+  
   return maxDist;
 }
 
@@ -915,6 +1005,168 @@ function calculateRouteMetricsWithHOS(orderedStops, warehouse, distanceMatrix, d
 }
 
 
+// --- ROUTE OPTIMIZATION & REBALANCING FUNCTIONS ---
+
+function rebalanceRoutes(routes, context) {
+  const { OVERPLAN_FACTOR } = context;
+  let improved = true;
+  let iterations = 0;
+  const MAX_REBALANCE_ITERATIONS = 10; // Prevent infinite loops
+  
+  Logger.log(`Starting route rebalancing with ${routes.length} routes`);
+  
+  while (improved && iterations < MAX_REBALANCE_ITERATIONS) {
+    improved = false;
+    iterations++;
+    
+    // Try to swap shipments between routes to improve utilization
+    for (let i = 0; i < routes.length; i++) {
+      for (let j = i + 1; j < routes.length; j++) {
+        const route1 = routes[i];
+        const route2 = routes[j];
+        
+        // Skip if routes are from different carriers or time slots
+        if (route1.carrier.name !== route2.carrier.name || route1.time !== route2.time) continue;
+        
+        // Try swapping each shipment from route1 with each from route2
+        for (let si = 0; si < route1.stops.length; si++) {
+          for (let sj = 0; sj < route2.stops.length; sj++) {
+            const stop1 = route1.stops[si];
+            const stop2 = route2.stops[sj];
+            
+            // Calculate current metrics
+            const currentScore = calculateRouteScore(route1, context) + calculateRouteScore(route2, context);
+            
+            // Try swap
+            route1.stops[si] = stop2;
+            route2.stops[sj] = stop1;
+            
+            // Calculate new metrics
+            const newScore = calculateRouteScore(route1, context) + calculateRouteScore(route2, context);
+            
+            if (newScore < currentScore && isRouteValid(route1, context) && isRouteValid(route2, context)) {
+              // Keep the swap
+              improved = true;
+              route1.totalPallets = route1.stops.reduce((sum, s) => sum + s.pallets, 0);
+              route2.totalPallets = route2.stops.reduce((sum, s) => sum + s.pallets, 0);
+            } else {
+              // Revert the swap
+              route1.stops[si] = stop1;
+              route2.stops[sj] = stop2;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+function calculateRouteScore(route, context) {
+  const metrics = calculateRouteMetricsWithHOS(route.stops, context.warehouse, context.distanceMatrix, context.detailedDurations);
+  const trailerSize = getRequiredTrailerSize(route, context.restrictions);
+  let capacity = 0;
+  switch (trailerSize) {
+    case '36': capacity = route.carrier.pallets36; break;
+    case '48': capacity = route.carrier.pallets48; break;
+    case '53': capacity = route.carrier.pallets53; break;
+  }
+  
+  // Calculate actual costs
+  const distanceCost = metrics.totalDistance * (route.carrier.costPerMile || 0);
+  const routeCost = route.carrier.costPerRoute || 0;
+  const totalCost = distanceCost + routeCost;
+  
+  // Penalize under-utilization
+  const utilization = route.totalPallets / capacity;
+  const utilizationPenalty = Math.pow(1 - utilization, 2) * 1000;
+  
+  return totalCost + utilizationPenalty;
+}
+
+function isRouteValid(route, context) {
+  const { MAX_ROUTE_MILEAGE, MAX_STOPS_GENERAL, OVERPLAN_FACTOR } = context;
+  
+  // Check basic constraints
+  if ([...new Set(route.stops.map(s => s.store))].length > MAX_STOPS_GENERAL) return false;
+  if (!isTempCompatible(new Set(route.stops.map(s => s.category)))) return false;
+  
+  // Check trailer capacity
+  const trailerSize = getRequiredTrailerSize(route, context.restrictions);
+  let capacity = 0;
+  switch (trailerSize) {
+    case '36': capacity = route.carrier.pallets36; break;
+    case '48': capacity = route.carrier.pallets48; break;
+    case '53': capacity = route.carrier.pallets53; break;
+  }
+  if (route.totalPallets > capacity * OVERPLAN_FACTOR) return false;
+  
+  // Check route metrics
+  const metrics = calculateRouteMetricsWithHOS(route.stops, context.warehouse, context.distanceMatrix, context.detailedDurations);
+  if (metrics.totalDistance > MAX_ROUTE_MILEAGE || metrics.hosStatus !== 'OK') return false;
+  
+  return true;
+}
+
+function utilizePullForwardRequests(remainingShipments, carriers, context, existingRoutes) {
+  const { MIN_PALLETS_PER_ROUTE } = context;
+  let unassigned = [...remainingShipments];
+  let routesCreated = [];
+
+  // Find unused carrier slots
+  carriers.forEach(carrier => {
+    carrier.timeSlots.forEach(timeSlot => {
+      if (timeSlot.used < timeSlot.capacity) {
+        const unusedSlots = timeSlot.capacity - timeSlot.used;
+        
+        for (let i = 0; i < unusedSlots; i++) {
+          // Try to create a route with remaining shipments
+          let potentialStops = [];
+          let totalPallets = 0;
+          let j = 0;
+          
+          while (j < unassigned.length && totalPallets < MIN_PALLETS_PER_ROUTE) {
+            const shipment = unassigned[j];
+            const tempRoute = {
+              carrier,
+              time: timeSlot.time,
+              stops: [...potentialStops, shipment],
+              totalPallets: totalPallets + shipment.pallets
+            };
+            
+            if (checkAndScoreInsertion(shipment, tempRoute, context, () => {}, 0) !== null) {
+              potentialStops.push(shipment);
+              totalPallets += shipment.pallets;
+              unassigned.splice(j, 1);
+            } else {
+              j++;
+            }
+          }
+          
+          if (potentialStops.length > 0) {
+            const route = {
+              carrier,
+              time: timeSlot.time,
+              stops: potentialStops,
+              totalPallets,
+              routeId: `${carrier.name.replace(/\s+/g, '')}_PF_${routesCreated.length + 1}`,
+              cluster: potentialStops[0].cluster,
+              notes: 'Pull Forward Request'
+            };
+            
+            routesCreated.push(route);
+            timeSlot.used++;
+          }
+        }
+      }
+    });
+  });
+
+  // Add new routes to existing routes array
+  existingRoutes.push(...routesCreated);
+  
+  return { remainingShipments: unassigned };
+}
+
 // --- DIAGNOSTIC & UTILITY HELPER FUNCTIONS ---
 
 /**
@@ -947,12 +1199,14 @@ function diagnoseUnusedCarrier(carrier, shipments, context) {
     return "FAIL: No time slots defined in 'Carriers_2' sheet.";
   }
 
+  const unusedCost = carrier.costNotToUse || 0;
+  
   for (const shipment of shipments) {
     for (const timeSlot of carrier.timeSlots) {
       const tempRoute = { carrier, time: timeSlot.time };
       const failureReason = getInitialRouteFailureReason(shipment, tempRoute, context);
       if (failureReason === null) {
-        return "NOTE: Carrier is valid but was not selected as the optimal choice for any available routes.";
+        return `NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $${unusedCost.toFixed(2)}`;
       }
     }
   }
@@ -961,7 +1215,7 @@ function diagnoseUnusedCarrier(carrier, shipments, context) {
   const firstTimeSlot = carrier.timeSlots[0];
   const representativeReason = getInitialRouteFailureReason(firstShipment, { carrier, time: firstTimeSlot.time }, context);
   
-  return `FAIL: Rejected for all shipments. Example Reason: ${representativeReason}`;
+  return `FAIL: Rejected for all shipments. Example Reason: ${representativeReason}. Cost not to use: $${unusedCost.toFixed(2)}`;
 }
 
 function getInitialRouteFailureReason(shipment, route, context) {
