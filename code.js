@@ -1,5 +1,25 @@
 /**
  * @OnlyCurrentDoc
+ * 
+ * LDPT - Logistics Distribution Planning Tool
+ * 
+ * RECENT OPTIMIZATIONS (for improved efficiency):
+ * - Reduced MAX_DISTANCE_BETWEEN_STOPS from 120 to 60 miles (hard limit 75 miles)
+ *   to reduce miles between stops and create tighter routes
+ * - Increased MIN_PALLETS_PER_ROUTE from 18 to 20 pallets to improve truck utilization
+ * - Strengthened utilization penalty in scoring (2000 -> 5000) to discourage underutilized trucks
+ * - Increased cluster penalty (500 -> 800) to keep routes more geographically focused
+ * - Reduced CLUSTER_FAILURE_THRESHOLD from 5 to 3 for tighter geographic clustering
+ * - Increased MAX_PLANNING_ATTEMPTS from 3 to 5 to try harder before marking shipments as unplannable
+ * - Enhanced rebalanceRoutes with route consolidation to reduce total truck count
+ * - Added proactive insertion logic in runPlanningLoop to fill existing routes before creating new ones
+ * - Increased pull-forward minimum threshold from 10 to 15 pallets to minimize unplanned trucks
+ * 
+ * These changes aim to:
+ * - Reduce unplanned trucks from 12-17 average to lower numbers
+ * - Increase overall truck utilization
+ * - Reduce leg distances to 50-75 miles maximum
+ * - Fully utilize available carrier resources
  */
 
 /**
