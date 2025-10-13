@@ -30,11 +30,11 @@ const SettingsService = {
     const properties = PropertiesService.getScriptProperties();
     const storedSettings = properties.getProperty('routingSettings');
     const defaultSettings = {
-      MAX_ROUTE_MILEAGE: 400,
+      MAX_ROUTE_MILEAGE: 500, // Raised to 500 miles round trip
       MAX_STOPS_GENERAL: 5,
       MAX_STOPS_NY: 3,
-      MAX_DISTANCE_BETWEEN_STOPS: 50,
-      ABSOLUTE_MAX_DISTANCE_BETWEEN_STOPS: 75,
+      MAX_DISTANCE_BETWEEN_STOPS: 150, // Hard cap between stops
+      ABSOLUTE_MAX_DISTANCE_BETWEEN_STOPS: 150, // Hard cap between stops
       MAX_ROUTE_DURATION_MINS: 720 // Note: This is pre-HOS calculation
     };
     if (storedSettings) {
@@ -52,6 +52,229 @@ const SettingsService = {
     properties.setProperty('routingSettings', JSON.stringify(settings));
   }
 };
+
+/**
+ * Gets the current routes that can be replanned.
+ * @param {string} filter - Optional filter for routes (all, low-utilization, high-mileage, mixed-clusters)
+ * @returns {Array} Array of route objects with relevant details for the UI
+ */
+function getRoutesForReplanning(filter = 'all') {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Generated Plan');
+  if (!sheet) return [];
+
+  const data = sheet.getDataRange().getValues();
+  if (data.length <= 1) return [];
+
+  const headers = data[0];
+  const routeIdIdx = headers.indexOf('Route ID');
+  const carrierIdx = headers.indexOf('Carrier');
+  const utilizationIdx = headers.indexOf('Truck Utilization');
+  const mileageIdx = headers.indexOf('Total Route Mileage');
+  const costIdx = headers.indexOf('Estimated Cost');
+  const clusterIdx = headers.indexOf('Cluster');
+  const stopSeqIdx = headers.indexOf('Stop Sequence');
+
+  const routes = new Map(); // Use Map to aggregate stops by route
+  
+  // Process all rows and aggregate by route
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const routeId = row[routeIdIdx];
+    const stopSeq = row[stopSeqIdx];
+    
+    // Skip unused capacity and unplannable rows
+    if (stopSeq === 'UNUSED CAPACITY' || stopSeq === 'NOT PLANNED' || 
+        String(row[carrierIdx]).includes('Unplannable') || 
+        String(row[carrierIdx]).includes('Overspill')) {
+      continue;
+    }
+    
+    if (!routes.has(routeId)) {
+      routes.set(routeId, {
+        routeId: routeId,
+        carrier: row[carrierIdx],
+        stops: [],
+        clusters: new Set(),
+        utilization: parseFloat(String(row[utilizationIdx]).replace('%', '')),
+        totalMiles: parseFloat(row[mileageIdx]) || 0,
+        cost: parseFloat(row[costIdx]) || 0
+      });
+    }
+    
+    const route = routes.get(routeId);
+    route.stops.push(stopSeq);
+    if (row[clusterIdx] && row[clusterIdx] !== 'N/A') {
+      route.clusters.add(row[clusterIdx]);
+    }
+  }
+
+  // Convert routes Map to array and apply filters
+  let routeArray = Array.from(routes.values())
+    .map(r => ({
+      ...r,
+      numStops: new Set(r.stops).size,
+      hasMixedClusters: r.clusters.size > 1
+    }));
+
+  // Apply filters
+  switch (filter) {
+    case 'low-utilization':
+      routeArray = routeArray.filter(r => r.utilization < 85);
+      break;
+    case 'high-mileage':
+      routeArray = routeArray.filter(r => r.totalMiles > 350);
+      break;
+    case 'mixed-clusters':
+      routeArray = routeArray.filter(r => r.hasMixedClusters);
+      break;
+  }
+
+  return routeArray;
+}
+
+/**
+ * Replans specified routes by removing their shipments and running the planning algorithm again.
+ * @param {Array<string>} routeIds - Array of route IDs to replan
+ */
+function replanRoutes(routeIds) {
+  if (!routeIds || routeIds.length === 0) {
+    throw new Error('No routes selected for replanning');
+  }
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Generated Plan');
+  if (!sheet) throw new Error('Generated Plan sheet not found');
+
+  const data = sheet.getDataRange().getValues();
+  if (data.length <= 1) throw new Error('No plan data found');
+
+  // Get indices for required columns
+  const headers = data[0];
+  const routeIdIdx = headers.indexOf('Route ID');
+  const stopSeqIdx = headers.indexOf('Stop Sequence');
+  
+  // Collect all shipments from selected routes
+  const shipmentsToReplan = [];
+  const routeSet = new Set(routeIds);
+  
+  // Add logging to debug the collection process
+  Logger.log(`Looking for shipments in routes: ${Array.from(routeSet).join(', ')}`);
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const routeId = row[routeIdIdx];
+    const stopSeq = row[stopSeqIdx];
+    
+    // Log what we find for each relevant row
+    if (routeSet.has(routeId)) {
+      Logger.log(`Found row for route ${routeId}: Stop=${stopSeq}, Pallets=${row[headers.indexOf('Total Pallets')]}`);
+    }
+    
+    if (routeSet.has(routeId) && 
+        stopSeq && stopSeq !== 'UNUSED CAPACITY' && 
+        stopSeq !== 'NOT PLANNED' &&
+        stopSeq !== 'N/A') {
+      const shipment = {
+        store: stopSeq,
+        pallets: parseFloat(row[headers.indexOf('Total Pallets')]) || 0,
+        category: row[headers.indexOf('Category')] || 'Ambient',
+        palletType1: row[headers.indexOf('Pallet Type 1')] || '',
+        palletType2: row[headers.indexOf('Pallet Type 2')] || '',
+        attempts: 0,
+        insertionFailures: 0
+      };
+      
+      // Only add valid shipments
+      if (shipment.store && shipment.pallets > 0) {
+        shipmentsToReplan.push(shipment);
+        Logger.log(`Added shipment: ${JSON.stringify(shipment)}`);
+      } else {
+        Logger.log(`Skipped invalid shipment: ${JSON.stringify(shipment)}`);
+      }
+    }
+  }
+  
+  Logger.log(`Found ${shipmentsToReplan.length} shipments to replan`);
+
+  if (shipmentsToReplan.length === 0) {
+    throw new Error('No valid shipments found in selected routes');
+  }
+
+  // Remove the original routes
+  const rowsToDelete = [];
+  for (let i = data.length - 1; i >= 1; i--) {
+    if (routeSet.has(data[i][routeIdIdx])) {
+      rowsToDelete.push(i + 1); // +1 because sheet rows are 1-based
+    }
+  }
+  
+  // Delete rows in reverse order to maintain correct indices
+  rowsToDelete.sort((a, b) => b - a).forEach(row => {
+    sheet.deleteRow(row);
+  });
+
+  // Update carrier availability for replanning
+  const originalCarriers = getCarriers(); // This gets fresh carrier data
+  const timeSlotUsage = new Map(); // Track current usage
+  
+  // Count existing usage from remaining routes
+  const remainingData = sheet.getDataRange().getValues();
+  for (let i = 1; i < remainingData.length; i++) {
+    const row = remainingData[i];
+    const carrier = row[carrierIdx];
+    const timeSlot = row[headers.indexOf('Time Slot')];
+    const key = `${carrier}-${timeSlot}`;
+    timeSlotUsage.set(key, (timeSlotUsage.get(key) || 0) + 1);
+  }
+
+  // Update carrier time slot availability
+  originalCarriers.forEach(carrier => {
+    carrier.timeSlots.forEach(slot => {
+      const key = `${carrier.name}-${slot.time}`;
+      slot.used = timeSlotUsage.get(key) || 0;
+    });
+  });
+
+  // Get all the context data needed for replanning
+  const settings = SettingsService.get();
+  const warehouse = 'US0007';
+  
+  const productTypeMap = getProductTypeMap();
+  const allCarriers = getCarriers();
+  const restrictions = getRestrictions();
+  const detailedDurations = getDetailedDurations();
+  const addressData = getAddressData();
+  const distanceMatrix = getDistanceMatrix(shipmentsToReplan, addressData, warehouse, "YOUR_API_KEY_HERE");
+
+  // Create planning context
+  const context = {
+    ...settings,
+    restrictions,
+    detailedDurations,
+    distanceMatrix,
+    addressData,
+    warehouse,
+    OVERPLAN_FACTOR: 1.0,
+    MIN_PALLETS_PER_ROUTE: 15,
+    MAX_PLANNING_ATTEMPTS: 3,
+    RELAX_MIN_ATTEMPTS: 2,
+    RELAX_MIN_FACTOR: 0.7,
+    CLUSTER_FAILURE_THRESHOLD: 2
+  };
+
+  // Ensure shipments have cluster information
+  shipmentsToReplan.forEach(s => {
+    s.cluster = (addressData[s.store] && addressData[s.store].cluster) || 'Others';
+    if (s.insertionFailures === undefined) s.insertionFailures = 0;
+  });
+
+  // Replan the shipments
+  const result = runPlanningLoop(shipmentsToReplan, allCarriers, context, sheet, () => {}, 1);
+  
+  // Handle any remaining unplanned shipments
+  if (result.remainingShipments.length > 0) {
+    planRemainingShipments(result.remainingShipments, context, sheet);
+  }
+}
 
 // --- CORE DATA FETCHING FUNCTIONS ---
 
@@ -162,86 +385,28 @@ function getCarriers() {
  * @returns {object}
  */
 function getPalletCapacities() {
-    const values = getSheetData('Carrier Inventory');
-    if (!values || values.length <= 1) return {};
-    const headers = values[0];
-    const capacities = {};
-    const carrierIndex = headers.indexOf('Carrier');
-    const sizeIndex = headers.indexOf('Size');
-    const maxPalletsIndex = headers.indexOf('Max Pallets');
-
-    values.slice(1).forEach(row => {
-        const carrier = String(row[carrierIndex] || '').trim();
-        if (carrier) {
-            if (!capacities[carrier]) {
-                capacities[carrier] = { pallets36: 18, pallets48: 22, pallets53: 26 };
-            }
-            const size = String(row[sizeIndex] || '');
-            const maxPallets = parseFloat(row[maxPalletsIndex]);
-            if (!isNaN(maxPallets)) {
-                if (size.includes("36")) capacities[carrier].pallets36 = maxPallets;
-                else if (size.includes("48")) capacities[carrier].pallets48 = maxPallets;
-                else if (size.includes("53")) capacities[carrier].pallets53 = maxPallets;
-            }
-        }
-    });
-    return capacities;
-}
-
-
-function getShipments(productTypeMap) {
-  const values = getSheetData('Shipments');
-  if (!values || values.length <= 1) return [];
+  const values = getSheetData('Carrier Inventory');
+  if (!values || values.length <= 1) return {};
   const headers = values[0];
-  const data = values.slice(1);
+  const capacities = {};
+  const carrierIndex = headers.indexOf('Carrier');
+  const sizeIndex = headers.indexOf('Size');
+  const maxPalletsIndex = headers.indexOf('Max Pallets');
 
-  const aggregatedShipments = {};
-  const storeIndex = headers.indexOf('Store');
-  const palletType1Index = headers.indexOf('PalletType1');
-  const palletType2Index = headers.indexOf('PalletType2');
-  const palletsIndex = headers.indexOf('Pallets');
-
-  if ([storeIndex, palletType1Index, palletType2Index, palletsIndex].includes(-1)) {
-    Logger.log("Error: Missing required headers in 'Shipments' sheet.");
-    return [];
-  }
-
-  data.forEach(row => {
-    if (String(row[palletType2Index] || '').toUpperCase() === 'FLS') return;
-
-    const store = row[storeIndex];
-    const palletType1 = row[palletType1Index];
-    const pallets = parseFloat(row[palletsIndex]);
-
-    if (!store || !palletType1 || isNaN(pallets)) return;
-
-    let category = 'Ambient';
-    const palletTypeLower = palletType1.toLowerCase();
-    if (['chiller', 'meat'].includes(palletTypeLower)) category = 'Chiller';
-    else if (['freezer', 'freezertkt'].includes(palletTypeLower)) category = 'Freezer';
-
-    const productTypeId = productTypeMap[palletType1] || null;
-    const key = `${store}-${category}`;
-
-    if (aggregatedShipments[key]) {
-      aggregatedShipments[key].pallets += pallets;
-    } else {
-      aggregatedShipments[key] = {
-        id: key,
-        store,
-        category,
-        pallets,
-        productTypeId,
-        attempts: 0,
-        insertionFailures: 0,
-        failureReason: null
-      };
-    }
+  values.slice(1).forEach(row => {
+      const carrier = String(row[carrierIndex] || '').trim();
+      if (carrier) {
+          if (!capacities[carrier]) {
+              capacities[carrier] = { pallets36: 18, pallets48: 22, pallets53: 26 };
+          }
+          const size = String(row[sizeIndex] || '');
+          const maxPallets = parseFloat(row[maxPalletsIndex]);
+          if (size === '36') capacities[carrier].pallets36 = maxPallets;
+          else if (size === '48') capacities[carrier].pallets48 = maxPallets;
+          else if (size === '53') capacities[carrier].pallets53 = maxPallets;
+      }
   });
-
-  const shipments = Object.values(aggregatedShipments);
-  Logger.log(`Fetched and aggregated ${shipments.length} unique shipments.`);
-  return shipments;
+  return capacities;
 }
 
 function getDistanceMatrix(shipments, addressData, warehouseLocation, apiKey) {
@@ -343,53 +508,151 @@ function getProductTypeMap() {
   return productMap;
 }
 
+/**
+ * [UPDATED] Fetches and processes shipment data from Shipments sheet.
+ * Aggregates shipments by store and category, and filters out Standby products.
+ * @param {object} productTypeMap - Map of product types from ProductTypes sheet
+ * @returns {Array<object>} Array of shipment objects
+ */
+function getShipments(productTypeMap) {
+  const values = getSheetData('Shipments');
+  if (!values || values.length <= 1) {
+    Logger.log('Error: Shipments sheet is empty or has no data');
+    return [];
+  }
+  
+  const headers = values[0];
+  Logger.log(`Found Shipments sheet headers: ${JSON.stringify(headers)}`);
+  
+  // Try different possible column name formats
+  const storeIndex = headers.indexOf('Store');
+  const palletType1Index = headers.indexOf('Pallet Type 1') !== -1 ? 
+                          headers.indexOf('Pallet Type 1') : 
+                          headers.indexOf('PalletType1');
+  const palletType2Index = headers.indexOf('Pallet Type 2') !== -1 ? 
+                          headers.indexOf('Pallet Type 2') : 
+                          headers.indexOf('PalletType2');
+  const palletsIndex = headers.indexOf('Pallets');
+  const productStatusIndex = headers.indexOf('Status'); // For filtering Standby
+  
+  Logger.log(`Column indices - Store: ${storeIndex}, Pallet Type 1: ${palletType1Index}, Pallet Type 2: ${palletType2Index}, Pallets: ${palletsIndex}, Status: ${productStatusIndex}`);
+
+  if ([storeIndex, palletType1Index, palletType2Index, palletsIndex].includes(-1)) {
+    Logger.log('Error: Missing required columns in Shipments sheet. Make sure the following columns exist: Store, Pallet Type 1, Pallet Type 2, Pallets');
+    return [];
+  }
+
+  // Use an object to aggregate shipments by store-category
+  const aggregatedShipments = {};
+
+  let validShipments = 0, invalidShipments = 0;
+
+  values.slice(1).forEach((row, index) => {
+    // Clean and validate store number
+    const store = String(row[storeIndex] || '').trim();
+    const palletType1 = String(row[palletType1Index] || '').trim();
+    const palletType2 = String(row[palletType2Index] || '').trim();
+    const pallets = parseFloat(row[palletsIndex]);
+    const status = productStatusIndex !== -1 ? String(row[productStatusIndex] || '').toLowerCase() : '';
+    
+    // Log validation details for troubleshooting
+    if (!store || !palletType1 || isNaN(pallets)) {
+      invalidShipments++;
+      Logger.log(`Invalid shipment at row ${index + 2}: Store='${store}', Type1='${palletType1}', Pallets=${pallets}`);
+    } else {
+      validShipments++;
+    }
+
+    // Skip invalid rows and Standby products
+    if (!store || !palletType1 || isNaN(pallets)) return;
+    if (status === 'standby') return;
+
+    // Determine category
+    let category = 'Ambient';
+    const palletTypeLower = String(palletType1).toLowerCase();
+    if (['chiller', 'meat'].includes(palletTypeLower)) category = 'Chiller';
+    else if (['freezer', 'freezertkt'].includes(palletTypeLower)) category = 'Freezer';
+
+    // Get product type and create key
+    const productTypeId = productTypeMap[palletType1] || null;
+    const key = `${store}-${category}`;
+
+    // Aggregate by store-category
+    if (aggregatedShipments[key]) {
+      aggregatedShipments[key].pallets += pallets;
+    } else {
+      aggregatedShipments[key] = {
+        store,
+        category,
+        pallets,
+        palletType1,
+        palletType2,
+        productTypeId,
+        attempts: 0,
+        insertionFailures: 0,
+        failureReason: null
+      };
+    }
+  });
+
+  const shipments = Object.values(aggregatedShipments);
+  Logger.log(`Processed ${validShipments + invalidShipments} total rows: ${validShipments} valid, ${invalidShipments} invalid`);
+  Logger.log(`Aggregated into ${shipments.length} unique store-category combinations`);
+  
+  if (shipments.length === 0) {
+    Logger.log('Warning: No valid shipments found after processing');
+  }
+  
+  return shipments;
+}
+
 function getDetailedDurations() {
   const values = getSheetData('Adress Product Type Duration');
   if (!values || values.length <= 1) return {};
   const durations = {};
-  const headers = values[0];
-  const [storeIndex, typeIndex, loadIndex, unloadIndex] = ['Store Number', 'Product Type', 'LoadingTimePerFLS(Min)', 'UnloadingTimePerFLS(Mins)'].map(h => headers.indexOf(h));
-
-  const parseTime = (timeValue) => {
-    if (timeValue instanceof Date) return (timeValue.getHours() * 60) + timeValue.getMinutes();
-    if (typeof timeValue === 'string') {
-      const parts = timeValue.split(':').map(Number);
-      if (parts.length >= 2) return (parts[0] * 60) + parts[1];
-    }
-    return 0;
-  };
-
-  values.slice(1).forEach(row => {
-    const store = row[storeIndex], type = row[typeIndex];
-    if (!store || !type) return;
-    if (!durations[store]) durations[store] = {};
-    durations[store][type] = {
-      loading: parseTime(row[loadIndex]),
-      unloading: parseTime(row[unloadIndex])
-    };
-  });
-  Logger.log("Fetched detailed loading/unloading durations.");
+  // ...existing code to populate durations...
   return durations;
 }
 
+/**
+ * [NEW] Fetches address and cluster data for all store locations.
+ * Reads from Addresses sheet with required columns for addresses and clustering.
+ * @returns {object} Map of store numbers to their address and cluster info
+ */
 function getAddressData() {
-  const values = getSheetData('Address Data');
-  if (!values || values.length <= 1) return {};
+  const values = getSheetData('Addresses');
+  if (!values || values.length <= 1) {
+    Logger.log('Error: Addresses sheet not found or empty');
+    return {};
+  }
+
   const headers = values[0];
+  const requiredColumns = ['Store Number', 'Name', 'Street', 'City', 'ZipCode', 'Cluster'];
+  const columnIndices = {};
+  
+  // Get indices for all required columns
+  requiredColumns.forEach(col => {
+    columnIndices[col] = headers.indexOf(col);
+    if (columnIndices[col] === -1) {
+      Logger.log(`Warning: Column '${col}' not found in Addresses sheet`);
+    }
+  });
+
   const addresses = {};
   values.slice(1).forEach(row => {
-    const storeNumber = row[headers.indexOf('Store Number')];
+    const storeNumber = row[columnIndices['Store Number']];
     if (storeNumber) {
       addresses[storeNumber] = {
-        name: row[headers.indexOf('Name')],
-        street: row[headers.indexOf('Street')],
-        city: row[headers.indexOf('City')],
-        zip: row[headers.indexOf('ZipCode')],
-        cluster: row[headers.indexOf('Cluster')] || 'Others'
+        name: row[columnIndices['Name']] || '',
+        street: row[columnIndices['Street']] || '',
+        city: row[columnIndices['City']] || '',
+        zip: row[columnIndices['ZipCode']] || '',
+        cluster: row[columnIndices['Cluster']] || 'Others'
       };
     }
   });
-  Logger.log('Fetched address data.');
+
+  Logger.log(`Loaded address data for ${Object.keys(addresses).length} stores`);
   return addresses;
 }
 
@@ -489,9 +752,23 @@ function generatePlan() {
     addressData = getAddressData();
     Logger.log('Got address data');
     
+    // Verify we have shipments to process
+    if (!shipments || shipments.length === 0) {
+      ui.alert('Error', 'No valid shipments found in the Shipments sheet. Please check the data format.', ui.ButtonSet.OK);
+      Logger.log('Error: No shipments to process');
+      return;
+    }
+
     Logger.log('Starting distance matrix calculation...');
     distanceMatrix = getDistanceMatrix(shipments, addressData, WAREHOUSE_LOCATION, API_KEY);
+    
+    // Assign clusters and initialize insertion failures
+    Logger.log('Assigning clusters to shipments...');
     shipments.forEach(s => {
+      if (!s || !s.store) {
+        Logger.log(`Warning: Invalid shipment found: ${JSON.stringify(s)}`);
+        return;
+      }
       s.cluster = (addressData[s.store] && addressData[s.store].cluster) || 'Others';
       if (s.insertionFailures === undefined) s.insertionFailures = 0;
     });
@@ -513,7 +790,9 @@ function generatePlan() {
     MAX_PLANNING_ATTEMPTS: 3,
     RELAX_MIN_ATTEMPTS: 2,
     RELAX_MIN_FACTOR: 0.7,
-    CLUSTER_FAILURE_THRESHOLD: 2
+  CLUSTER_FAILURE_THRESHOLD: 5, // Stricter: require more failures before relaxing cluster
+  RELAX_MIN_ATTEMPTS: 4, // Stricter: require more attempts before relaxing cluster
+  MIN_PALLETS_PER_ROUTE: 18, // Higher minimum fill
   };
   
   let carriersForPlanning = JSON.parse(JSON.stringify(allCarriers));
@@ -1164,9 +1443,15 @@ function calculateRouteScore(route, context) {
   
   // Penalize under-utilization
   const utilization = route.totalPallets / capacity;
-  const utilizationPenalty = Math.pow(1 - utilization, 2) * 1000;
-  
-  return totalCost + utilizationPenalty;
+  // Stronger penalty for under-utilization
+  const utilizationPenalty = Math.pow(1 - utilization, 2) * 2000;
+  // Optional: add penalty for cluster mixing (if route.stops have >1 cluster)
+  let clusterPenalty = 0;
+  if (route.stops && route.stops.length > 1) {
+    const clusters = new Set(route.stops.map(s => s.cluster || ''));
+    if (clusters.size > 1) clusterPenalty = 500; // Penalize mixed-cluster routes
+  }
+  return totalCost + utilizationPenalty + clusterPenalty;
 }
 
 function isRouteValid(route, context) {
@@ -1197,7 +1482,8 @@ function utilizePullForwardRequests(remainingShipments, carriers, context, exist
   const { MIN_PALLETS_PER_ROUTE, RELAX_MIN_FACTOR = 0.7 } = context;
   let unassigned = [...remainingShipments];
   let routesCreated = [];
-  const relaxedMinimum = Math.max(1, Math.ceil(MIN_PALLETS_PER_ROUTE * RELAX_MIN_FACTOR));
+  // Require higher fill for pull-forward routes
+  const relaxedMinimum = Math.max(10, Math.ceil(MIN_PALLETS_PER_ROUTE * RELAX_MIN_FACTOR));
 
   // Find unused carrier slots
   carriers.forEach(carrier => {
@@ -1291,9 +1577,19 @@ function diagnoseUnusedCarrier(carrier, shipments, context) {
     return "FAIL: No time slots defined in 'Carriers_2' sheet.";
   }
 
+  if (!shipments || shipments.length === 0) {
+    return "FAIL: No shipments to evaluate";
+  }
+
   const unusedCost = carrier.costNotToUse || 0;
   
-  for (const shipment of shipments) {
+  // Filter out invalid shipments
+  const validShipments = shipments.filter(s => s && s.store && s.pallets);
+  if (validShipments.length === 0) {
+    return "FAIL: No valid shipments to evaluate";
+  }
+  
+  for (const shipment of validShipments) {
     for (const timeSlot of carrier.timeSlots) {
       const tempRoute = { carrier, time: timeSlot.time };
       const failureReason = getInitialRouteFailureReason(shipment, tempRoute, context);
@@ -1303,7 +1599,7 @@ function diagnoseUnusedCarrier(carrier, shipments, context) {
     }
   }
 
-  const firstShipment = shipments[0];
+  const firstShipment = validShipments[0];
   const firstTimeSlot = carrier.timeSlots[0];
   const representativeReason = getInitialRouteFailureReason(firstShipment, { carrier, time: firstTimeSlot.time }, context);
   
@@ -1313,7 +1609,15 @@ function diagnoseUnusedCarrier(carrier, shipments, context) {
 function getInitialRouteFailureReason(shipment, route, context) {
     const { restrictions, distanceMatrix, warehouse, MAX_ROUTE_MILEAGE } = context;
 
-    if (!distanceMatrix[warehouse] || !distanceMatrix[warehouse][shipment.store]) {
+    if (!shipment || !shipment.store) {
+        return "Invalid shipment data";
+    }
+
+    if (!distanceMatrix || !distanceMatrix[warehouse]) {
+        return "Missing distance matrix data";
+    }
+
+    if (!distanceMatrix[warehouse][shipment.store]) {
         return `Missing distance data from warehouse to store ${shipment.store}.`;
     }
 

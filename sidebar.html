@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: 'Inter', sans-serif; }
+    .loader {
+      border: 4px solid #f3f3f3; border-radius: 50%;
+      border-top: 4px solid #3498db; width: 24px; height: 24px;
+      animation: spin 2s linear infinite;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); }
+    }
+    input[type=number], input[type=time] { text-align: right; }
+  </style>
+</head>
+<body class="bg-gray-50 p-4">
+  <div class="space-y-6">
+
+    <!-- Routing Parameters Section -->
+    <div>
+      <h2 class="text-lg font-bold text-gray-800">Routing Parameters</h2>
+      <p class="text-sm text-gray-500">Adjust the core logic for generating routes.</p>
+    </div>
+    <div id="settings-container" class="space-y-3 bg-white p-3 rounded-lg shadow-sm border border-gray-200">
+        <div class="flex items-center justify-between">
+          <label for="max-mileage" class="text-sm font-medium text-gray-700">Max Route Mileage</label>
+          <input type="number" id="max-mileage" min="0" class="w-24 rounded-md border-gray-300 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50">
+        </div>
+        <div class="flex items-center justify-between">
+          <label for="max-stops" class="text-sm font-medium text-gray-700">Max Stops per Route</label>
+          <input type="number" id="max-stops" min="1" class="w-24 rounded-md border-gray-300 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50">
+        </div>
+        <div class="flex items-center justify-between">
+          <label for="max-dist-stops" class="text-sm font-medium text-gray-700">Max Miles from First Stop</label>
+          <input type="number" id="max-dist-stops" min="0" class="w-24 rounded-md border-gray-300 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50">
+        </div>
+        <div class="flex items-center justify-between">
+          <label for="max-duration" class="text-sm font-medium text-gray-700">Max Route Duration (Min)</label>
+          <input type="number" id="max-duration" min="0" class="w-24 rounded-md border-gray-300 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50">
+        </div>
+    </div>
+
+    <!-- Carrier Capacity Section -->
+    <div>
+      <h2 class="text-lg font-bold text-gray-800">Carrier Capacity</h2>
+      <p class="text-sm text-gray-500">Update truck capacity for each time slot.</p>
+    </div>
+    <div id="carrier-list" class="space-y-4">
+      <div class="flex justify-center items-center h-32"><div class="loader"></div></div>
+    </div>
+
+    <!-- Action Buttons -->
+    <div class="space-y-2 pt-4 border-t">
+      <button id="save-button" class="w-full bg-blue-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-400">
+        Save Changes
+      </button>
+      <p id="status" class="text-sm text-center text-gray-600 h-5"></p>
+    </div>
+  </div>
+
+<script>
+  let originalCarrierData = {};
+
+  function showLoading(message = 'Loading...') {
+    document.getElementById('status').textContent = message;
+    document.getElementById('save-button').disabled = true;
+  }
+
+  function hideLoading() {
+    document.getElementById('status').textContent = '';
+    document.getElementById('save-button').disabled = false;
+  }
+
+  function showError(error) {
+    document.getElementById('status').textContent = 'Error: ' + error.message;
+    hideLoading();
+  }
+
+  /**
+   * Renders the carrier data with dynamic fields for adding/removing time slots.
+   */
+  function displayData(data) {
+    if (!data || data.error) {
+      showError({ message: data ? data.error : "Failed to retrieve data." });
+      return;
+    }
+    
+    const { settings, carriers } = data;
+    document.getElementById('max-mileage').value = settings.MAX_ROUTE_MILEAGE || 400;
+    document.getElementById('max-stops').value = settings.MAX_STOPS_GENERAL || 5;
+    document.getElementById('max-dist-stops').value = settings.MAX_DISTANCE_BETWEEN_STOPS || 50;
+    document.getElementById('max-duration').value = settings.MAX_ROUTE_DURATION_MINS || 720;
+    
+    originalCarrierData = JSON.parse(JSON.stringify(carriers));
+    const list = document.getElementById('carrier-list');
+    list.innerHTML = ''; 
+
+    if (Object.keys(carriers).length === 0) {
+      list.innerHTML = '<p class="text-gray-500 text-center">No carrier data found.</p>';
+    } else {
+      for (const carrierName in carriers) {
+        const carrierDiv = document.createElement('div');
+        carrierDiv.className = 'bg-white p-3 rounded-lg shadow-sm border border-gray-200';
+        carrierDiv.innerHTML = `
+          <h3 class="font-bold text-md text-gray-900 mb-2">${carrierName}</h3>
+          <div id="slots-${carrierName}" class="space-y-2"></div>
+          <button class="add-slot-btn mt-2 text-sm text-blue-600 hover:text-blue-800" data-carrier="${carrierName}">+ Add Time Slot</button>
+        `;
+        list.appendChild(carrierDiv);
+        renderSlots(carrierName, carriers[carrierName]);
+      }
+    }
+    hideLoading();
+  }
+
+  /**
+   * Renders the time slots for a specific carrier.
+   */
+  function renderSlots(carrierName, slots) {
+    const container = document.getElementById(`slots-${carrierName}`);
+    container.innerHTML = '';
+    slots.forEach((slot, index) => {
+      const slotDiv = document.createElement('div');
+      slotDiv.className = 'flex items-center justify-between space-x-2';
+      slotDiv.innerHTML = `
+        <input type="time" value="${slot.time}" class="time-input w-24 rounded-md border-gray-300 shadow-sm">
+        <input type="number" value="${slot.capacity}" min="0" class="capacity-input w-20 rounded-md border-gray-300 shadow-sm">
+        <button class="remove-slot-btn text-red-500 hover:text-red-700" data-carrier="${carrierName}" data-index="${index}">×</button>
+      `;
+      container.appendChild(slotDiv);
+    });
+  }
+
+  /**
+   * Gathers all data from the form and sends it to the server for saving.
+   */
+  function saveChanges() {
+    showLoading('Saving...');
+    
+    const settings = {
+      MAX_ROUTE_MILEAGE: parseInt(document.getElementById('max-mileage').value, 10),
+      MAX_STOPS_GENERAL: parseInt(document.getElementById('max-stops').value, 10),
+      MAX_DISTANCE_BETWEEN_STOPS: parseInt(document.getElementById('max-dist-stops').value, 10),
+      MAX_ROUTE_DURATION_MINS: parseInt(document.getElementById('max-duration').value, 10),
+    };
+
+    const updatedCapacities = {};
+    document.querySelectorAll('[id^="slots-"]').forEach(container => {
+      const carrierName = container.id.replace('slots-', '');
+      updatedCapacities[carrierName] = [];
+      container.querySelectorAll('.flex').forEach(slotDiv => {
+        const time = slotDiv.querySelector('.time-input').value;
+        const capacity = parseInt(slotDiv.querySelector('.capacity-input').value, 10);
+        if (time) {
+          updatedCapacities[carrierName].push({ time, capacity });
+        }
+      });
+    });
+    
+    const payload = { settings, capacities: updatedCapacities };
+
+    google.script.run
+      .withSuccessHandler(response => {
+        document.getElementById('status').textContent = response;
+        setTimeout(() => { if (document.getElementById('status').textContent === response) { document.getElementById('status').textContent = ''; }}, 2000);
+        hideLoading();
+        // Refresh data to show saved state
+        google.script.run.withSuccessHandler(displayData).withFailureHandler(showError).getSidebarData();
+      })
+      .withFailureHandler(showError)
+      .saveSidebarData(payload);
+  }
+
+  // Event delegation for dynamic buttons
+  document.getElementById('carrier-list').addEventListener('click', function(e) {
+    if (e.target.classList.contains('add-slot-btn')) {
+      const carrierName = e.target.dataset.carrier;
+      const container = document.getElementById(`slots-${carrierName}`);
+      const slotDiv = document.createElement('div');
+      slotDiv.className = 'flex items-center justify-between space-x-2';
+      slotDiv.innerHTML = `
+        <input type="time" value="00:00" class="time-input w-24 rounded-md border-gray-300 shadow-sm">
+        <input type="number" value="0" min="0" class="capacity-input w-20 rounded-md border-gray-300 shadow-sm">
+        <button class="remove-slot-btn text-red-500 hover:text-red-700" onclick="this.parentElement.remove()">×</button>
+      `;
+      container.appendChild(slotDiv);
+    }
+    if (e.target.classList.contains('remove-slot-btn')) {
+      e.target.parentElement.remove();
+    }
+  });
+
+  document.getElementById('save-button').addEventListener('click', saveChanges);
+  
+  showLoading('Loading settings and capacities...');
+  google.script.run
+      .withSuccessHandler(displayData)
+      .withFailureHandler(showError)
+      .getSidebarData();
+</script>
+</body>
+</html>
