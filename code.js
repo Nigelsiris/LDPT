@@ -705,7 +705,16 @@ function setupPlanSheet() {
 
 function generateDiagnosticReport(planSheet, settings) {
   try {
-    const stats = { totalRoutes: 0, totalPallets: 0, totalMileage: 0, totalDuration: 0, hosViolations: 0, overMileage: 0, utilization: [] };
+    const stats = { 
+      totalRoutes: 0, 
+      totalPallets: 0, 
+      totalMileage: 0, 
+      totalDuration: 0, 
+      hosViolations: 0, 
+      overMileage: 0, 
+      utilization: [],
+      mileageByRoute: [] // Track individual route mileages for better analysis
+    };
     const planData = planSheet.getDataRange().getValues();
     if (!planData || planData.length <= 1) {
       Logger.log('Diagnostic: No planned routes to report.');
@@ -718,6 +727,7 @@ function generateDiagnosticReport(planSheet, settings) {
     const hosIdx = headers.indexOf('HOS Status');
     const utilIdx = headers.indexOf('Truck Utilization');
     const mileageStatusIdx = headers.indexOf('Mileage Status');
+    const routeIdIdx = headers.indexOf('Route ID');
 
     const parseNumber = (value) => {
       if (typeof value === 'number') return value;
@@ -737,6 +747,7 @@ function generateDiagnosticReport(planSheet, settings) {
       stats.totalPallets += pallets;
       const routeMiles = parseNumber(row[milesIdx]);
       stats.totalMileage += routeMiles;
+      stats.mileageByRoute.push({ routeId: row[routeIdIdx], miles: routeMiles });
       stats.totalDuration += parseNumber(row[durationIdx]);
       if (row[hosIdx] && row[hosIdx].toString().toUpperCase() !== 'OK') stats.hosViolations++;
       const mileageStatus = mileageStatusIdx !== -1 ? String(row[mileageStatusIdx] || '').toUpperCase() : '';
@@ -745,15 +756,33 @@ function generateDiagnosticReport(planSheet, settings) {
       const utilPct = utilStr.endsWith('%') ? parseFloat(utilStr) / 100 : parseNumber(utilStr);
       if (utilPct > 0 && utilPct <= 1.5) stats.utilization.push(utilPct);
     }
+    
+    // Calculate mileage statistics
     const avgUtil = stats.utilization.length ? (stats.utilization.reduce((a,b)=>a+b,0)/stats.utilization.length) : 0;
+    const avgMileage = stats.totalRoutes ? (stats.totalMileage / stats.totalRoutes) : 0;
+    const sortedMileages = stats.mileageByRoute.map(r => r.miles).sort((a,b) => a-b);
+    const maxMileage = sortedMileages.length > 0 ? sortedMileages[sortedMileages.length - 1] : 0;
+    const minMileage = sortedMileages.length > 0 ? sortedMileages[0] : 0;
+    
     Logger.log('--- PLAN DIAGNOSTIC REPORT ---');
     Logger.log('Total Routes: ' + stats.totalRoutes);
     Logger.log('Total Pallets: ' + stats.totalPallets);
     Logger.log('Total Mileage: ' + stats.totalMileage);
     Logger.log('Avg Pallets/Truck: ' + (stats.totalRoutes ? (stats.totalPallets/stats.totalRoutes).toFixed(2) : 0));
     Logger.log('Avg Utilization: ' + (avgUtil*100).toFixed(1) + '%');
+    Logger.log('Avg Route Mileage: ' + avgMileage.toFixed(1) + ' miles');
+    Logger.log('Min Route Mileage: ' + minMileage.toFixed(1) + ' miles');
+    Logger.log('Max Route Mileage: ' + maxMileage.toFixed(1) + ' miles');
     Logger.log('Routes Over Mileage: ' + stats.overMileage);
     Logger.log('HOS Violations: ' + stats.hosViolations);
+    
+    // Log the top 5 longest routes for debugging
+    if (stats.mileageByRoute.length > 0) {
+      const topRoutes = stats.mileageByRoute.sort((a,b) => b.miles - a.miles).slice(0, 5);
+      Logger.log('Top 5 Longest Routes:');
+      topRoutes.forEach(r => Logger.log(`  ${r.routeId}: ${r.miles.toFixed(1)} miles`));
+    }
+    
     Logger.log('-----------------------------');
   } catch (e) {
     Logger.log('Error in diagnostic report: ' + e);
@@ -1288,6 +1317,12 @@ function writeRouteToSheet(route, planSheet, context) {
   const optimizedStops = advancedOptimizeStopOrder(route.stops, warehouse, distanceMatrix);
   const metrics = calculateRouteMetricsWithHOS(optimizedStops, warehouse, distanceMatrix, detailedDurations);
   const trailerSize = getRequiredTrailerSize(route, restrictions);
+  
+  // Log warning for routes approaching or exceeding mileage limits
+  if (metrics.totalDistance > MAX_ROUTE_MILEAGE * 0.85) {
+    const stores = [...new Set(optimizedStops.map(s => s.store))].join(' -> ');
+    Logger.log(`WARNING: Route ${route.routeId} has ${metrics.totalDistance} miles (${(metrics.totalDistance/MAX_ROUTE_MILEAGE*100).toFixed(1)}% of max). Stores: ${stores}`);
+  }
   
   let capacity = 0;
   if (route.carrier.name.includes('Unplannable') || route.carrier.name.includes('Overspill')) {
