@@ -30,12 +30,14 @@ const SettingsService = {
     const properties = PropertiesService.getScriptProperties();
     const storedSettings = properties.getProperty('routingSettings');
     const defaultSettings = {
-      MAX_ROUTE_MILEAGE: 500, // Raised to 500 miles round trip
+      MAX_ROUTE_MILEAGE: 500, // 500-mile round trip cap
       MAX_STOPS_GENERAL: 5,
       MAX_STOPS_NY: 3,
-      MAX_DISTANCE_BETWEEN_STOPS: 150, // Hard cap between stops
-      ABSOLUTE_MAX_DISTANCE_BETWEEN_STOPS: 150, // Hard cap between stops
-      MAX_ROUTE_DURATION_MINS: 720 // Note: This is pre-HOS calculation
+      MAX_DISTANCE_BETWEEN_STOPS: 120, // Stricter leg cap to block long jumps
+      ABSOLUTE_MAX_DISTANCE_BETWEEN_STOPS: 120, // Hard leg limit
+      MAX_ROUTE_DURATION_MINS: 720, // Pre-HOS duration limit
+      ALLOW_ALL_ALL: true, // Enable ALL-ALL rule for ambient/chiller/produce
+      SMALL_AMBIENT_THRESHOLD: 6 // Allow up to 6 pallets when mixing ambient/produce with chiller
     };
     if (storedSettings) {
       try {
@@ -128,7 +130,6 @@ function getRoutesForReplanning(filter = 'all') {
       routeArray = routeArray.filter(r => r.hasMixedClusters);
       break;
   }
-
   return routeArray;
 }
 
@@ -274,6 +275,9 @@ function replanRoutes(routeIds) {
   if (result.remainingShipments.length > 0) {
     planRemainingShipments(result.remainingShipments, context, sheet);
   }
+
+  // Diagnostics after replanning
+  try { generateDiagnosticReport(sheet, settings); } catch(e) { Logger.log('Diagnostics error: '+e); }
 }
 
 // --- CORE DATA FETCHING FUNCTIONS ---
@@ -673,6 +677,65 @@ function setupPlanSheet() {
   return sheet;
 }
 
+// --- DIAGNOSTICS ---
+
+function generateDiagnosticReport(planSheet, settings) {
+  try {
+    const stats = { totalRoutes: 0, totalPallets: 0, totalMileage: 0, totalDuration: 0, hosViolations: 0, overMileage: 0, utilization: [] };
+    const planData = planSheet.getDataRange().getValues();
+    if (!planData || planData.length <= 1) {
+      Logger.log('Diagnostic: No planned routes to report.');
+      return;
+    }
+    const headers = planData[0];
+    const palletsIdx = headers.indexOf('Total Pallets');
+    const milesIdx = headers.indexOf('Total Route Mileage');
+    const durationIdx = headers.indexOf('Total Duration (min)');
+    const hosIdx = headers.indexOf('HOS Status');
+    const utilIdx = headers.indexOf('Truck Utilization');
+    const mileageStatusIdx = headers.indexOf('Mileage Status');
+
+    const parseNumber = (value) => {
+      if (typeof value === 'number') return value;
+      if (typeof value === 'string') {
+        const cleaned = value.replace(/[^0-9.-]/g, '');
+        const parsed = parseFloat(cleaned);
+        return isNaN(parsed) ? 0 : parsed;
+      }
+      return 0;
+    };
+
+    for (let i = 1; i < planData.length; i++) {
+      const row = planData[i];
+      if (!row || String(row[0] || '').includes('Unplannable') || String(row[0] || '').includes('Overspill')) continue;
+      stats.totalRoutes++;
+      const pallets = parseNumber(row[palletsIdx]);
+      stats.totalPallets += pallets;
+      const routeMiles = parseNumber(row[milesIdx]);
+      stats.totalMileage += routeMiles;
+      stats.totalDuration += parseNumber(row[durationIdx]);
+      if (row[hosIdx] && row[hosIdx].toString().toUpperCase() !== 'OK') stats.hosViolations++;
+      const mileageStatus = mileageStatusIdx !== -1 ? String(row[mileageStatusIdx] || '').toUpperCase() : '';
+      if (mileageStatus === 'OVER' || routeMiles > (settings.MAX_ROUTE_MILEAGE || 500)) stats.overMileage++;
+      const utilStr = String(row[utilIdx] || '');
+      const utilPct = utilStr.endsWith('%') ? parseFloat(utilStr) / 100 : parseNumber(utilStr);
+      if (utilPct > 0 && utilPct <= 1.5) stats.utilization.push(utilPct);
+    }
+    const avgUtil = stats.utilization.length ? (stats.utilization.reduce((a,b)=>a+b,0)/stats.utilization.length) : 0;
+    Logger.log('--- PLAN DIAGNOSTIC REPORT ---');
+    Logger.log('Total Routes: ' + stats.totalRoutes);
+    Logger.log('Total Pallets: ' + stats.totalPallets);
+    Logger.log('Total Mileage: ' + stats.totalMileage);
+    Logger.log('Avg Pallets/Truck: ' + (stats.totalRoutes ? (stats.totalPallets/stats.totalRoutes).toFixed(2) : 0));
+    Logger.log('Avg Utilization: ' + (avgUtil*100).toFixed(1) + '%');
+    Logger.log('Routes Over Mileage: ' + stats.overMileage);
+    Logger.log('HOS Violations: ' + stats.hosViolations);
+    Logger.log('-----------------------------');
+  } catch (e) {
+    Logger.log('Error in diagnostic report: ' + e);
+  }
+}
+
 function parseTimeToMinutes(timeStr) {
   if (!timeStr || typeof timeStr !== 'string') return null;
   let match = timeStr.match(/^(\d{1,2}):(\d{2})$/);
@@ -698,8 +761,47 @@ function isTimeInWindow(routeTimeStr, windowStr) {
   return startTime <= endTime ? (routeTime >= startTime && routeTime <= endTime) : (routeTime >= startTime || routeTime <= endTime);
 }
 
-function isTempCompatible(requiredCategories) {
-  return !(requiredCategories.has('Chiller') && requiredCategories.has('Freezer'));
+/**
+ * Determines if a set of product categories can co-load on a single trailer.
+ * Default: disallow Chiller + Freezer together.
+ * New behavior: allow ALL-ALL mixes when all stores/categories are identical or when
+ * a small ambient/produce quantity can be carried with freezer (configurable threshold).
+ * @param {Set<string>} requiredCategories - set of category strings present on the route/stops
+ * @param {object} [options] - optional overrides: { allowAllAll: boolean, smallAmbientThreshold: number, details: {perStoreCounts} }
+ */
+function isTempCompatible(requiredCategories, options) {
+  options = options || {};
+  const allowAllAll = options.allowAllAll || false;
+  const smallAmbientThreshold = options.smallAmbientThreshold || 6;
+  const perStoreCounts = options.details && options.details.perStoreCounts ? options.details.perStoreCounts : null;
+
+  const hasAmbient = requiredCategories.has('Ambient');
+  const hasProduce = requiredCategories.has('Produce');
+  const hasChiller = requiredCategories.has('Chiller');
+  const hasFreezer = requiredCategories.has('Freezer');
+
+  // Freezer rules: cannot mix with Chiller, and cannot mix with Ambient/Produce
+  if (hasFreezer) {
+    if (hasChiller) return false;
+    if (hasAmbient || hasProduce) return false;
+    return true;
+  }
+
+  // No freezer present: optionally allow ALL-ALL (Ambient+Chiller+Produce) with small ambient/produce override
+  if (allowAllAll) {
+    if (!perStoreCounts) return true;
+    return Object.keys(perStoreCounts).every(storeId => {
+      const counts = perStoreCounts[storeId] || {};
+      const hasStoreChiller = (counts.Chiller || 0) > 0;
+      const ambientTotal = (counts.Ambient || 0) + (counts.Produce || 0);
+      // If store has chiller plus ambient/produce, enforce threshold
+      if (hasStoreChiller && ambientTotal > smallAmbientThreshold) return false;
+      return true;
+    });
+  }
+
+  // Default fallback: disallow Chiller+Ambient mixes without override? Keep previous behaviour (only block Chiller+Freezer)
+  return !(hasChiller && hasFreezer);
 }
 
 function formatStopSequence(stops) {
@@ -846,6 +948,9 @@ function generatePlan() {
   });
 
   updateDashboard();
+
+  // Generate diagnostics after plan build
+  try { generateDiagnosticReport(planSheet, settings); } catch(e) { Logger.log('Diagnostics error: '+e); }
 
   ui.alert('Success', 'Planning complete! Check the Dashboard sheet for analytics.', ui.ButtonSet.OK);
 }
@@ -1001,7 +1106,14 @@ function checkAndScoreInsertion(shipment, route, context, log, iter) {
   const tempStops = [...route.stops, shipment];
   if ([...new Set(tempStops.map(s => s.store))].length > MAX_STOPS_GENERAL) return null;
 
-  if (!isTempCompatible(new Set(tempStops.map(s => s.category)))) return null;
+  // Build per-store category pallet counts for the small-ambient override
+  const perStoreCounts = {};
+  tempStops.forEach(s => {
+    if (!perStoreCounts[s.store]) perStoreCounts[s.store] = {};
+    perStoreCounts[s.store][s.category] = (perStoreCounts[s.store][s.category] || 0) + (s.pallets || 0);
+  });
+
+  if (!isTempCompatible(new Set(tempStops.map(s => s.category)), { allowAllAll: context.ALLOW_ALL_ALL || false, smallAmbientThreshold: context.SMALL_AMBIENT_THRESHOLD || 4, details: { perStoreCounts } })) return null;
 
   if (restrictions[shipment.store] && restrictions[shipment.store].deliveryWindow && restrictions[shipment.store].deliveryWindow.trim() !== '' && restrictions[shipment.store].deliveryWindow.toUpperCase() !== 'N/A' && !isTimeInWindow(route.time, restrictions[shipment.store].deliveryWindow)) return null;
 
@@ -1325,6 +1437,8 @@ function calculateRouteMetricsWithHOS(orderedStops, warehouse, distanceMatrix, d
         breaksTaken++;
       }
       travelTime += leg.duration;
+      // Accumulate the leg distance for travel between stops (includes warehouse->first stop)
+      totalDistance += leg.distance;
       onDutyTime += leg.duration;
     }
     
@@ -1359,6 +1473,9 @@ function calculateRouteMetricsWithHOS(orderedStops, warehouse, distanceMatrix, d
   // Final HOS checks
   if (travelTime > DRIVING_LIMIT) hosStatus = 'DRIVING_VIOLATION';
   if (onDutyTime > ON_DUTY_LIMIT) hosStatus = 'ON_DUTY_VIOLATION';
+
+  // Log computed metrics for debugging and validation
+  Logger.log(`calculateRouteMetricsWithHOS: stops=${orderedStops.length}, travelTime=${Math.round(travelTime)}, stopTime=${Math.round(stopTime)}, totalDuration=${Math.round(onDutyTime)}, totalDistance=${Math.round(totalDistance)}, hosStatus=${hosStatus}`);
 
   return {
     travelTime: Math.round(travelTime),
@@ -1459,7 +1576,13 @@ function isRouteValid(route, context) {
   
   // Check basic constraints
   if ([...new Set(route.stops.map(s => s.store))].length > MAX_STOPS_GENERAL) return false;
-  if (!isTempCompatible(new Set(route.stops.map(s => s.category)))) return false;
+  // Build per-store counts for temperature compatibility checks
+  const perStoreCounts = {};
+  route.stops.forEach(s => {
+    if (!perStoreCounts[s.store]) perStoreCounts[s.store] = {};
+    perStoreCounts[s.store][s.category] = (perStoreCounts[s.store][s.category] || 0) + (s.pallets || 0);
+  });
+  if (!isTempCompatible(new Set(route.stops.map(s => s.category)), { allowAllAll: context.ALLOW_ALL_ALL || false, smallAmbientThreshold: context.SMALL_AMBIENT_THRESHOLD || 4, details: { perStoreCounts } })) return false;
   
   // Check trailer capacity
   const trailerSize = getRequiredTrailerSize(route, context.restrictions);
