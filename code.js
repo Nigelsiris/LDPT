@@ -1,5 +1,25 @@
 /**
  * @OnlyCurrentDoc
+ * 
+ * LDPT - Logistics Distribution Planning Tool
+ * 
+ * RECENT OPTIMIZATIONS (for improved efficiency):
+ * - Reduced MAX_DISTANCE_BETWEEN_STOPS from 120 to 60 miles (hard limit 75 miles)
+ *   to reduce miles between stops and create tighter routes
+ * - Increased MIN_PALLETS_PER_ROUTE from 18 to 20 pallets to improve truck utilization
+ * - Strengthened utilization penalty in scoring (2000 -> 5000) to discourage underutilized trucks
+ * - Increased cluster penalty (500 -> 800) to keep routes more geographically focused
+ * - Reduced CLUSTER_FAILURE_THRESHOLD from 5 to 3 for tighter geographic clustering
+ * - Increased MAX_PLANNING_ATTEMPTS from 3 to 5 to try harder before marking shipments as unplannable
+ * - Enhanced rebalanceRoutes with route consolidation to reduce total truck count
+ * - Added proactive insertion logic in runPlanningLoop to fill existing routes before creating new ones
+ * - Increased pull-forward minimum threshold from 10 to 15 pallets to minimize unplanned trucks
+ * 
+ * These changes aim to:
+ * - Reduce unplanned trucks from 12-17 average to lower numbers
+ * - Increase overall truck utilization
+ * - Reduce leg distances to 50-75 miles maximum
+ * - Fully utilize available carrier resources
  */
 
 /**
@@ -33,8 +53,8 @@ const SettingsService = {
       MAX_ROUTE_MILEAGE: 500, // 500-mile round trip cap
       MAX_STOPS_GENERAL: 5,
       MAX_STOPS_NY: 3,
-      MAX_DISTANCE_BETWEEN_STOPS: 120, // Stricter leg cap to block long jumps
-      ABSOLUTE_MAX_DISTANCE_BETWEEN_STOPS: 120, // Hard leg limit
+      MAX_DISTANCE_BETWEEN_STOPS: 60, // Reduced from 120 to 60 miles for tighter routing
+      ABSOLUTE_MAX_DISTANCE_BETWEEN_STOPS: 75, // Reduced from 120 to 75 miles max leg
       MAX_ROUTE_DURATION_MINS: 720, // Pre-HOS duration limit
       ALLOW_ALL_ALL: true, // Enable ALL-ALL rule for ambient/chiller/produce
       SMALL_AMBIENT_THRESHOLD: 6 // Allow up to 6 pallets when mixing ambient/produce with chiller
@@ -255,11 +275,11 @@ function replanRoutes(routeIds) {
     addressData,
     warehouse,
     OVERPLAN_FACTOR: 1.0,
-    MIN_PALLETS_PER_ROUTE: 15,
-    MAX_PLANNING_ATTEMPTS: 3,
-    RELAX_MIN_ATTEMPTS: 2,
-    RELAX_MIN_FACTOR: 0.7,
-    CLUSTER_FAILURE_THRESHOLD: 2
+    MIN_PALLETS_PER_ROUTE: 20, // Increased from 15 to 20 for better utilization
+    MAX_PLANNING_ATTEMPTS: 5, // Increased attempts to try harder
+    RELAX_MIN_ATTEMPTS: 4, // Require more attempts before relaxing
+    RELAX_MIN_FACTOR: 0.8, // Less relaxation (was 0.7)
+    CLUSTER_FAILURE_THRESHOLD: 3 // Reduced to keep routes more clustered
   };
 
   // Ensure shipments have cluster information
@@ -888,13 +908,11 @@ function generatePlan() {
     addressData,
     warehouse: WAREHOUSE_LOCATION,
     OVERPLAN_FACTOR: 1.0,
-    MIN_PALLETS_PER_ROUTE: 15,
-    MAX_PLANNING_ATTEMPTS: 3,
-    RELAX_MIN_ATTEMPTS: 2,
-    RELAX_MIN_FACTOR: 0.7,
-  CLUSTER_FAILURE_THRESHOLD: 5, // Stricter: require more failures before relaxing cluster
-  RELAX_MIN_ATTEMPTS: 4, // Stricter: require more attempts before relaxing cluster
-  MIN_PALLETS_PER_ROUTE: 18, // Higher minimum fill
+    MIN_PALLETS_PER_ROUTE: 20, // Increased from 18 to 20 for better utilization
+    MAX_PLANNING_ATTEMPTS: 5, // Increased attempts to try harder
+    RELAX_MIN_ATTEMPTS: 4, // Require more attempts before relaxing
+    RELAX_MIN_FACTOR: 0.8, // Less relaxation (was 0.7)
+    CLUSTER_FAILURE_THRESHOLD: 3, // Reduced from 5 to 3 to keep routes more clustered
   };
   
   let carriersForPlanning = JSON.parse(JSON.stringify(allCarriers));
@@ -971,6 +989,40 @@ function runPlanningLoop(shipmentsToPlan, availableCarriers, context, planSheet,
     let planningInProgress = true;
     while (planningInProgress) {
         unassignedShipments.sort((a, b) => b.pallets - a.pallets);
+        
+        // Before creating new routes, try to fit unassigned shipments into existing routes
+        if (routes.length > 0) {
+            const insertedIndices = [];
+            for (let i = unassignedShipments.length - 1; i >= 0; i--) {
+                const shipment = unassignedShipments[i];
+                if (shipment.failureReason) continue;
+                
+                let bestRouteIndex = -1;
+                let bestScore = Infinity;
+                
+                for (let r = 0; r < routes.length; r++) {
+                    const route = routes[r];
+                    const score = checkAndScoreInsertion(shipment, route, context, log, iteration);
+                    if (score !== null && score < bestScore) {
+                        bestScore = score;
+                        bestRouteIndex = r;
+                    }
+                }
+                
+                if (bestRouteIndex >= 0) {
+                    routes[bestRouteIndex].stops.push(shipment);
+                    routes[bestRouteIndex].totalPallets += shipment.pallets;
+                    insertedIndices.push(i);
+                }
+            }
+            
+            // Remove inserted shipments from unassigned list
+            insertedIndices.forEach(idx => unassignedShipments.splice(idx, 1));
+            
+            if (insertedIndices.length > 0) {
+                Logger.log(`Inserted ${insertedIndices.length} shipments into existing routes`);
+            }
+        }
         
         let seedIndex = unassignedShipments.findIndex(s => s.attempts < MAX_PLANNING_ATTEMPTS && !s.failureReason);
         
@@ -1493,7 +1545,7 @@ function rebalanceRoutes(routes, context) {
   const { OVERPLAN_FACTOR } = context;
   let improved = true;
   let iterations = 0;
-  const MAX_REBALANCE_ITERATIONS = 10; // Prevent infinite loops
+  const MAX_REBALANCE_ITERATIONS = 15; // Increased from 10 to 15 for more thorough optimization
   
   Logger.log(`Starting route rebalancing with ${routes.length} routes`);
   
@@ -1501,7 +1553,51 @@ function rebalanceRoutes(routes, context) {
     improved = false;
     iterations++;
     
-    // Try to swap shipments between routes to improve utilization
+    // First pass: Try to consolidate routes by moving all shipments from one route to another
+    for (let i = routes.length - 1; i >= 0; i--) {
+      if (routes[i].stops.length === 0) continue;
+      
+      for (let j = 0; j < routes.length; j++) {
+        if (i === j) continue;
+        
+        const sourceRoute = routes[i];
+        const targetRoute = routes[j];
+        
+        // Skip if routes are from different carriers or time slots
+        if (sourceRoute.carrier.name !== targetRoute.carrier.name || sourceRoute.time !== targetRoute.time) continue;
+        
+        // Try to move all shipments from source to target
+        let canMoveAll = true;
+        const tempStops = [...targetRoute.stops];
+        const tempPallets = targetRoute.totalPallets;
+        
+        for (const stop of sourceRoute.stops) {
+          const testRoute = {
+            ...targetRoute,
+            stops: tempStops,
+            totalPallets: tempPallets + stop.pallets
+          };
+          
+          if (checkAndScoreInsertion(stop, testRoute, context, () => {}, 0) === null) {
+            canMoveAll = false;
+            break;
+          }
+          tempStops.push(stop);
+        }
+        
+        if (canMoveAll && isRouteValid({...targetRoute, stops: tempStops, totalPallets: tempPallets + sourceRoute.totalPallets}, context)) {
+          // Consolidate: move all stops from source to target
+          targetRoute.stops.push(...sourceRoute.stops);
+          targetRoute.totalPallets += sourceRoute.totalPallets;
+          routes.splice(i, 1); // Remove empty source route
+          improved = true;
+          Logger.log(`Consolidated route ${sourceRoute.routeId} into ${targetRoute.routeId}`);
+          break;
+        }
+      }
+    }
+    
+    // Second pass: Try to swap shipments between routes to improve utilization
     for (let i = 0; i < routes.length; i++) {
       for (let j = i + 1; j < routes.length; j++) {
         const route1 = routes[i];
@@ -1523,24 +1619,35 @@ function rebalanceRoutes(routes, context) {
             route1.stops[si] = stop2;
             route2.stops[sj] = stop1;
             
+            // Update pallet counts
+            const newRoute1Pallets = route1.stops.reduce((sum, s) => sum + s.pallets, 0);
+            const newRoute2Pallets = route2.stops.reduce((sum, s) => sum + s.pallets, 0);
+            const oldRoute1Pallets = route1.totalPallets;
+            const oldRoute2Pallets = route2.totalPallets;
+            
+            route1.totalPallets = newRoute1Pallets;
+            route2.totalPallets = newRoute2Pallets;
+            
             // Calculate new metrics
             const newScore = calculateRouteScore(route1, context) + calculateRouteScore(route2, context);
             
             if (newScore < currentScore && isRouteValid(route1, context) && isRouteValid(route2, context)) {
               // Keep the swap
               improved = true;
-              route1.totalPallets = route1.stops.reduce((sum, s) => sum + s.pallets, 0);
-              route2.totalPallets = route2.stops.reduce((sum, s) => sum + s.pallets, 0);
             } else {
               // Revert the swap
               route1.stops[si] = stop1;
               route2.stops[sj] = stop2;
+              route1.totalPallets = oldRoute1Pallets;
+              route2.totalPallets = oldRoute2Pallets;
             }
           }
         }
       }
     }
   }
+  
+  Logger.log(`Rebalancing complete after ${iterations} iterations. Final route count: ${routes.length}`);
 }
 
 function calculateRouteScore(route, context) {
@@ -1558,15 +1665,15 @@ function calculateRouteScore(route, context) {
   const routeCost = route.carrier.costPerRoute || 0;
   const totalCost = distanceCost + routeCost;
   
-  // Penalize under-utilization
+  // Penalize under-utilization more aggressively
   const utilization = route.totalPallets / capacity;
-  // Stronger penalty for under-utilization
-  const utilizationPenalty = Math.pow(1 - utilization, 2) * 2000;
+  // Much stronger penalty for under-utilization to push towards fuller trucks
+  const utilizationPenalty = Math.pow(1 - utilization, 2) * 5000; // Increased from 2000 to 5000
   // Optional: add penalty for cluster mixing (if route.stops have >1 cluster)
   let clusterPenalty = 0;
   if (route.stops && route.stops.length > 1) {
     const clusters = new Set(route.stops.map(s => s.cluster || ''));
-    if (clusters.size > 1) clusterPenalty = 500; // Penalize mixed-cluster routes
+    if (clusters.size > 1) clusterPenalty = 800; // Increased from 500 to 800
   }
   return totalCost + utilizationPenalty + clusterPenalty;
 }
@@ -1602,11 +1709,11 @@ function isRouteValid(route, context) {
 }
 
 function utilizePullForwardRequests(remainingShipments, carriers, context, existingRoutes) {
-  const { MIN_PALLETS_PER_ROUTE, RELAX_MIN_FACTOR = 0.7 } = context;
+  const { MIN_PALLETS_PER_ROUTE, RELAX_MIN_FACTOR = 0.8 } = context;
   let unassigned = [...remainingShipments];
   let routesCreated = [];
-  // Require higher fill for pull-forward routes
-  const relaxedMinimum = Math.max(10, Math.ceil(MIN_PALLETS_PER_ROUTE * RELAX_MIN_FACTOR));
+  // Require higher fill for pull-forward routes to minimize unplanned trucks
+  const relaxedMinimum = Math.max(15, Math.ceil(MIN_PALLETS_PER_ROUTE * RELAX_MIN_FACTOR)); // Increased from 10
 
   // Find unused carrier slots
   carriers.forEach(carrier => {
