@@ -29,16 +29,23 @@ const SettingsService = {
   get: function() {
     const properties = PropertiesService.getScriptProperties();
     const storedSettings = properties.getProperty('routingSettings');
-    if (storedSettings) {
-      return JSON.parse(storedSettings);
-    }
-    return {
+    const defaultSettings = {
       MAX_ROUTE_MILEAGE: 400,
       MAX_STOPS_GENERAL: 5,
       MAX_STOPS_NY: 3,
       MAX_DISTANCE_BETWEEN_STOPS: 50,
+      ABSOLUTE_MAX_DISTANCE_BETWEEN_STOPS: 75,
       MAX_ROUTE_DURATION_MINS: 720 // Note: This is pre-HOS calculation
     };
+    if (storedSettings) {
+      try {
+        const parsed = JSON.parse(storedSettings);
+        return { ...defaultSettings, ...parsed };
+      } catch (e) {
+        Logger.log(`Warning: Failed to parse stored routing settings: ${e}`);
+      }
+    }
+    return defaultSettings;
   },
   save: function(settings) {
     const properties = PropertiesService.getScriptProperties();
@@ -219,7 +226,16 @@ function getShipments(productTypeMap) {
     if (aggregatedShipments[key]) {
       aggregatedShipments[key].pallets += pallets;
     } else {
-      aggregatedShipments[key] = { id: key, store, category, pallets, productTypeId, attempts: 0, failureReason: null };
+      aggregatedShipments[key] = {
+        id: key,
+        store,
+        category,
+        pallets,
+        productTypeId,
+        attempts: 0,
+        insertionFailures: 0,
+        failureReason: null
+      };
     }
   });
 
@@ -475,14 +491,30 @@ function generatePlan() {
     
     Logger.log('Starting distance matrix calculation...');
     distanceMatrix = getDistanceMatrix(shipments, addressData, WAREHOUSE_LOCATION, API_KEY);
-    shipments.forEach(s => s.cluster = (addressData[s.store] && addressData[s.store].cluster) || 'Others');
+    shipments.forEach(s => {
+      s.cluster = (addressData[s.store] && addressData[s.store].cluster) || 'Others';
+      if (s.insertionFailures === undefined) s.insertionFailures = 0;
+    });
   } catch (e) {
     ui.alert('Error loading data. Check script logs.');
     Logger.log("Data Loading Error: " + e.toString() + e.stack);
     return;
   }
 
-  const context = { ...settings, restrictions, detailedDurations, distanceMatrix, addressData, warehouse: WAREHOUSE_LOCATION, OVERPLAN_FACTOR: 1.0, MIN_PALLETS_PER_ROUTE: 15, MAX_PLANNING_ATTEMPTS: 3 };
+  const context = {
+    ...settings,
+    restrictions,
+    detailedDurations,
+    distanceMatrix,
+    addressData,
+    warehouse: WAREHOUSE_LOCATION,
+    OVERPLAN_FACTOR: 1.0,
+    MIN_PALLETS_PER_ROUTE: 15,
+    MAX_PLANNING_ATTEMPTS: 3,
+    RELAX_MIN_ATTEMPTS: 2,
+    RELAX_MIN_FACTOR: 0.7,
+    CLUSTER_FAILURE_THRESHOLD: 2
+  };
   
   let carriersForPlanning = JSON.parse(JSON.stringify(allCarriers));
 
@@ -542,7 +574,14 @@ function generatePlan() {
 function runPlanningLoop(shipmentsToPlan, availableCarriers, context, planSheet, log, startIteration) {
     let unassignedShipments = [...shipmentsToPlan];
     let iteration = startIteration;
-    const { MAX_PLANNING_ATTEMPTS, MIN_PALLETS_PER_ROUTE, restrictions } = context;
+    const {
+        MAX_PLANNING_ATTEMPTS,
+        MIN_PALLETS_PER_ROUTE,
+        restrictions,
+        RELAX_MIN_ATTEMPTS = 2,
+        RELAX_MIN_FACTOR = 0.7,
+        CLUSTER_FAILURE_THRESHOLD = 2
+    } = context;
     let routes = []; // Track all created routes for rebalancing
 
     let planningInProgress = true;
@@ -580,20 +619,30 @@ function runPlanningLoop(shipmentsToPlan, availableCarriers, context, planSheet,
         }
 
         const currentRoute = bestRouteOption.route;
+        currentRoute.seedAttempts = seedShipment.attempts;
         let routeChanged = true;
         while (routeChanged) {
             routeChanged = false;
             let bestCandidate = null, bestScore = Infinity;
-            
+
             for (let i = unassignedShipments.length - 1; i >= 0; i--) {
                 const candidate = unassignedShipments[i];
                 if (candidate.failureReason) continue;
-                if (currentRoute.cluster !== 'Others' && candidate.cluster !== currentRoute.cluster) continue;
-                
+                if (candidate.insertionFailures === undefined) candidate.insertionFailures = 0;
+
+                const differentCluster = currentRoute.cluster !== 'Others' && candidate.cluster !== currentRoute.cluster;
+                const canRelaxCluster = differentCluster && (candidate.insertionFailures >= CLUSTER_FAILURE_THRESHOLD || currentRoute.seedAttempts >= RELAX_MIN_ATTEMPTS);
+                if (differentCluster && !canRelaxCluster) {
+                    candidate.insertionFailures++;
+                    continue;
+                }
+
                 const score = checkAndScoreInsertion(candidate, currentRoute, context, log, iteration);
                 if (score !== null && score < bestScore) {
                     bestScore = score;
                     bestCandidate = { shipment: candidate, index: i };
+                } else if (score === null) {
+                    candidate.insertionFailures++;
                 }
             }
 
@@ -601,6 +650,7 @@ function runPlanningLoop(shipmentsToPlan, availableCarriers, context, planSheet,
                 const addedShipment = unassignedShipments.splice(bestCandidate.index, 1)[0];
                 currentRoute.stops.push(addedShipment);
                 currentRoute.totalPallets += addedShipment.pallets;
+                addedShipment.insertionFailures = 0;
                 if (currentRoute.cluster === 'Others' && addedShipment.cluster !== 'Others') {
                     currentRoute.cluster = addedShipment.cluster;
                 }
@@ -608,8 +658,11 @@ function runPlanningLoop(shipmentsToPlan, availableCarriers, context, planSheet,
             }
         }
 
-        if (currentRoute.totalPallets < MIN_PALLETS_PER_ROUTE) {
+        const relaxedMinimum = Math.max(1, Math.ceil(MIN_PALLETS_PER_ROUTE * (currentRoute.seedAttempts >= RELAX_MIN_ATTEMPTS ? RELAX_MIN_FACTOR : 1)));
+
+        if (currentRoute.totalPallets < relaxedMinimum) {
             currentRoute.stops.forEach(stop => {
+                stop.insertionFailures = (stop.insertionFailures || 0) + 1;
                 unassignedShipments.push(stop);
             });
         } else {
@@ -649,7 +702,16 @@ function findBestInitialCarrier(shipment, carriers, context) {
 }
 
 function checkAndScoreInsertion(shipment, route, context, log, iter) {
-  const { restrictions, distanceMatrix, warehouse, OVERPLAN_FACTOR, MAX_ROUTE_MILEAGE, MAX_STOPS_GENERAL, MAX_DISTANCE_BETWEEN_STOPS } = context;
+  const {
+    restrictions,
+    distanceMatrix,
+    warehouse,
+    OVERPLAN_FACTOR,
+    MAX_ROUTE_MILEAGE,
+    MAX_STOPS_GENERAL,
+    MAX_DISTANCE_BETWEEN_STOPS,
+    ABSOLUTE_MAX_DISTANCE_BETWEEN_STOPS
+  } = context;
 
   // Validate input parameters
   if (!shipment || !route || !context || !distanceMatrix || !warehouse) {
@@ -659,12 +721,9 @@ function checkAndScoreInsertion(shipment, route, context, log, iter) {
 
   const tempStops = [...route.stops, shipment];
   if ([...new Set(tempStops.map(s => s.store))].length > MAX_STOPS_GENERAL) return null;
-  
-  const firstStopDistance = getDistanceFromFirstStop(tempStops, distanceMatrix);
-  if (firstStopDistance === null || firstStopDistance > MAX_DISTANCE_BETWEEN_STOPS) return null;
-  
+
   if (!isTempCompatible(new Set(tempStops.map(s => s.category)))) return null;
-  
+
   if (restrictions[shipment.store] && restrictions[shipment.store].deliveryWindow && restrictions[shipment.store].deliveryWindow.trim() !== '' && restrictions[shipment.store].deliveryWindow.toUpperCase() !== 'N/A' && !isTimeInWindow(route.time, restrictions[shipment.store].deliveryWindow)) return null;
 
   const carrier = route.carrier;
@@ -679,16 +738,32 @@ function checkAndScoreInsertion(shipment, route, context, log, iter) {
   
   if (!capacity || (route.totalPallets || 0) + shipment.pallets > (capacity * OVERPLAN_FACTOR)) return null;
 
+  const currentOptimized = advancedOptimizeStopOrder(route.stops, warehouse, distanceMatrix);
   const tempOptimized = advancedOptimizeStopOrder(tempStops, warehouse, distanceMatrix);
+  const preferredLegThreshold = MAX_DISTANCE_BETWEEN_STOPS || 50;
+  const hardLegLimit = ABSOLUTE_MAX_DISTANCE_BETWEEN_STOPS || Math.max(75, preferredLegThreshold);
+
+  const currentLegDetails = getLegDistanceDetails(currentOptimized, distanceMatrix);
+  if (currentLegDetails.hasMissingData) return null;
+
+  const proposedLegDetails = getLegDistanceDetails(tempOptimized, distanceMatrix);
+  if (proposedLegDetails.hasMissingData) return null;
+
+  const proposedMaxLeg = proposedLegDetails.legDistances.length > 0 ? Math.max(...proposedLegDetails.legDistances) : 0;
+  if (proposedMaxLeg > hardLegLimit) return null;
+
+  const distancePenaltyDelta = calculateDistancePenalty(proposedLegDetails.legDistances, preferredLegThreshold)
+    - calculateDistancePenalty(currentLegDetails.legDistances, preferredLegThreshold);
+
   const tempMetrics = calculateRouteMetricsWithHOS(tempOptimized, warehouse, distanceMatrix, context.detailedDurations);
   if (tempMetrics.totalDistance > MAX_ROUTE_MILEAGE || tempMetrics.hosStatus !== 'OK') return null;
 
-  const originalMetrics = calculateRouteMetricsWithHOS(advancedOptimizeStopOrder(route.stops, warehouse, distanceMatrix), warehouse, distanceMatrix, context.detailedDurations);
-  
+  const originalMetrics = calculateRouteMetricsWithHOS(currentOptimized, warehouse, distanceMatrix, context.detailedDurations);
+
   const newCost = (tempMetrics.totalDistance * carrier.costPerMile) + carrier.costPerRoute;
   const oldCost = (originalMetrics.totalDistance * carrier.costPerMile) + carrier.costPerRoute;
 
-  return newCost - oldCost; // Return the change in cost
+  return (newCost - oldCost) + distancePenaltyDelta; // Return cost delta adjusted for leg distance penalties
 }
 
 function planRemainingShipments(shipments, context, planSheet) {
@@ -823,34 +898,45 @@ function getRequiredTrailerSize(route, restrictions) {
   return '53';
 }
 
-function getDistanceFromFirstStop(stops, distanceMatrix) {
-  if (!stops || !distanceMatrix || stops.length < 2) return 0;
-  
-  let maxDist = 0;
-  const firstStopId = stops[0].store;
-  
-  if (!firstStopId || !distanceMatrix[firstStopId]) {
-    Logger.log(`Warning: Missing distance data for first stop ${firstStopId}`);
-    return null;
+function getLegDistanceDetails(stops, distanceMatrix) {
+  if (!stops || !distanceMatrix || stops.length === 0) {
+    return { legDistances: [], hasMissingData: false };
   }
-  
-  for (let i = 1; i < stops.length; i++) {
-    const currentStore = stops[i].store;
-    if (!currentStore) {
-      Logger.log(`Warning: Invalid store ID at index ${i}`);
-      continue;
-    }
-    
-    const leg = distanceMatrix[firstStopId][currentStore];
+
+  const uniqueStores = [...new Set(stops.map(s => s.store))];
+  if (uniqueStores.length < 2) {
+    return { legDistances: [], hasMissingData: false };
+  }
+
+  const legDistances = [];
+  for (let i = 1; i < uniqueStores.length; i++) {
+    const from = uniqueStores[i - 1];
+    const to = uniqueStores[i];
+    if (!from || !to) continue;
+
+    const forwardLeg = distanceMatrix[from] && distanceMatrix[from][to];
+    const reverseLeg = distanceMatrix[to] && distanceMatrix[to][from];
+    const leg = forwardLeg || reverseLeg;
+
     if (!leg) {
-      Logger.log(`Warning: Missing distance data between ${firstStopId} and ${currentStore}`);
-      continue;
+      Logger.log(`Warning: Missing distance data between ${from} and ${to}`);
+      return { legDistances: [], hasMissingData: true };
     }
-    
-    if (leg.distance > maxDist) maxDist = leg.distance;
+
+    legDistances.push(leg.distance);
   }
-  
-  return maxDist;
+
+  return { legDistances, hasMissingData: false };
+}
+
+function calculateDistancePenalty(legDistances, preferredThreshold) {
+  if (!legDistances || legDistances.length === 0) return 0;
+  const threshold = preferredThreshold || 0;
+  return legDistances.reduce((penalty, distance) => {
+    if (distance <= threshold) return penalty;
+    const overage = distance - threshold;
+    return penalty + (overage * overage);
+  }, 0);
 }
 
 function formatDetailedRoute(orderedStops, warehouse, distanceMatrix) {
@@ -1108,9 +1194,10 @@ function isRouteValid(route, context) {
 }
 
 function utilizePullForwardRequests(remainingShipments, carriers, context, existingRoutes) {
-  const { MIN_PALLETS_PER_ROUTE } = context;
+  const { MIN_PALLETS_PER_ROUTE, RELAX_MIN_FACTOR = 0.7 } = context;
   let unassigned = [...remainingShipments];
   let routesCreated = [];
+  const relaxedMinimum = Math.max(1, Math.ceil(MIN_PALLETS_PER_ROUTE * RELAX_MIN_FACTOR));
 
   // Find unused carrier slots
   carriers.forEach(carrier => {
@@ -1124,6 +1211,7 @@ function utilizePullForwardRequests(remainingShipments, carriers, context, exist
           let totalPallets = 0;
           let j = 0;
           
+          const extracted = [];
           while (j < unassigned.length && totalPallets < MIN_PALLETS_PER_ROUTE) {
             const shipment = unassigned[j];
             const tempRoute = {
@@ -1132,17 +1220,19 @@ function utilizePullForwardRequests(remainingShipments, carriers, context, exist
               stops: [...potentialStops, shipment],
               totalPallets: totalPallets + shipment.pallets
             };
-            
+
             if (checkAndScoreInsertion(shipment, tempRoute, context, () => {}, 0) !== null) {
               potentialStops.push(shipment);
               totalPallets += shipment.pallets;
-              unassigned.splice(j, 1);
+              shipment.insertionFailures = 0;
+              extracted.push(unassigned.splice(j, 1)[0]);
             } else {
+              shipment.insertionFailures = (shipment.insertionFailures || 0) + 1;
               j++;
             }
           }
-          
-          if (potentialStops.length > 0) {
+
+          if (totalPallets >= relaxedMinimum) {
             const route = {
               carrier,
               time: timeSlot.time,
@@ -1152,9 +1242,11 @@ function utilizePullForwardRequests(remainingShipments, carriers, context, exist
               cluster: potentialStops[0].cluster,
               notes: 'Pull Forward Request'
             };
-            
+
             routesCreated.push(route);
             timeSlot.used++;
+          } else if (extracted.length > 0) {
+            unassigned.push(...extracted);
           }
         }
       }
