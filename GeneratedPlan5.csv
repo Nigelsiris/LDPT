@@ -1,0 +1,52 @@
+Carrier,Route ID,Cluster,Stops,Stop Sequence,Detailed Route,Total Route Mileage,Has Restrictions?,Trailer Size,Temp Zones,Total Pallets,Truck Utilization,Total Travel (min),Total Stop Time (min),Total Duration (min),HOS Status,Estimated Cost,Mileage Status,Notes,Map Link
+CIR,CIR_1,Others,3,1443 (AMB) / 8002 (AMB) / 8021 (AMB),1443 (51.3 mi) -> 8002 (18.4 mi) -> 8021,415,No,53',Single Temp,25.79,99.20%,483.00,45.00,558,OK,152.98,OK, [Single Temp (Ambient): 3 stops],N/A
+CIR,CIR_2,Others,3,1434 (CHI) / 1119 (CHI) / 1590 (CHI),1434 (33.1 mi) -> 1119 (58.5 mi) -> 1590,400,Yes,36',Single Temp,13.74,76.30%,487.00,45.00,562,OK,144.12,OK, [Single Temp (Cold): 3 stops],N/A
+CIR,CIR_3,Others,3,"8004 (AMB,CHI) / 8017 (AMB) / 8006 (AMB)",8004 (11.3 mi) -> 8017 (12.6 mi) -> 8006,423,No,53',Dual Temp,25.95,99.80%,473.00,60.00,563,OK,N/A,OK, [COLD CHAIN WARNING] [Front: 3 ambient stops | Rear: 1 cold stops],N/A
+CIR,CIR_4,Others,3,"1119 (AMB) / 1440 (AMB) / 1448 (AMB,CHI)",1119 (37.9 mi) -> 1440 (15.2 mi) -> 1448,377,No,53',Dual Temp,17.82,68.50%,455.00,60.00,545,OK,N/A,OK, [Front: 3 ambient stops | Rear: 1 cold stops],N/A
+SCH,SCH_5,Others,3,1561 (CHI) / 1559 (CHI) / 8002 (CHI),1561 (9.5 mi) -> 1559 (18.4 mi) -> 8002,376,Yes,48',Single Temp,20.13,91.50%,459.00,45.00,534,OK,288,OK, [Single Temp (Cold): 3 stops],N/A
+SCH,SCH_6,Others,3,"1410 (AMB) / 1581 (AMB,CHI) / 1440 (CHI)",1410 (0 mi) -> 1581 (7.1 mi) -> 1440,333,No,53',Dual Temp,23.17,89.10%,392.00,60.00,452,OK,266.5,OK, [Front: 2 ambient stops | Rear: 2 cold stops],N/A
+SCH,SCH_7,Others,3,1564 (CHI) / 1572 (CHI) / 1576 (CHI),1564 (18.1 mi) -> 1572 (8.2 mi) -> 1576,379,Yes,48',Single Temp,21.81,99.10%,436.00,45.00,511,OK,321.83,OK, [Single Temp (Cold): 3 stops],N/A
+SCH,SCH_8,Others,3,"1203 (AMB,CHI) / 1431 (CHI) / 1094 (CHI)",1203 (25.4 mi) -> 1431 (23.3 mi) -> 1094,176,No,53',Dual Temp,21.26,81.80%,228,60,288,OK,188,OK, [Front: 1 ambient stops | Rear: 3 cold stops],N/A
+SCH,SCH_9,Others,3,1559 (AMB) / 8021 (CHI) / 8006 (CHI),1559 (24.9 mi) -> 8021 (12 mi) -> 8006,420,Yes,48',Dual Temp,18.65,84.80%,472,45,547,OK,310,OK, [Front: 1 ambient stops | Rear: 2 cold stops],N/A
+SCH,SCH_10,Others,3,1561 (AMB) / 1503 (CHI) / 8007 (CHI),1561 (44.6 mi) -> 1503 (4.7 mi) -> 8007,417,No,53',Dual Temp,25.37,97.60%,489,45,564,OK,308.5,OK, [Front: 1 ambient stops | Rear: 2 cold stops],N/A
+SCH,SCH_11,Others,3,1576 (AMB) / 8017 (CHI) / 1410 (CHI),1576 (16.8 mi) -> 8017 (39.2 mi) -> 1410,403,No,53',Dual Temp,22.1,85.00%,467,45,542,OK,333.83,OK, [Front: 1 ambient stops | Rear: 2 cold stops],N/A
+SCH,SCH_12,Others,3,1545 (CHI) / 1433 (CHI) / 1443 (CHI),1545 (40.1 mi) -> 1433 (18.3 mi) -> 1443,349,No,53',Single Temp,16.35,62.90%,452,45,527,OK,283.21,OK, [Single Temp (Cold): 3 stops],N/A
+HB,HB_13,Others,3,"1250 (AMB) / 1429 (AMB,CHI) / 1425 (CHI)",1250 (22.3 mi) -> 1429 (44.9 mi) -> 1425,271,No,53',Dual Temp,21.54,82.80%,349,60,409,OK,235.5,OK, [Front: 2 ambient stops | Rear: 2 cold stops],N/A
+Consolidated Overspill,ConsolidatedOvsp_1,Others,1,"1023 (AMB,CHI)",1023,36,No,53',Dual Temp,7.91,N/A,49,30,79,OK,N/A,OK,Consolidated 2 shipments for store 1023 [Front: 1 ambient stops | Rear: 1 cold stops],N/A
+Consolidated Overspill,ConsolidatedOvsp_2,Others,1,"1166 (AMB,CHI)",1166,140,No,53',Dual Temp,17.78,N/A,165,30,195,OK,N/A,OK,Consolidated 2 shipments for store 1166 [Front: 1 ambient stops | Rear: 1 cold stops],N/A
+Consolidated Overspill,ConsolidatedOvsp_3,Others,1,"1250 (CHI,FRE)",1250,160,No,53',Single Temp,9.78,N/A,193,30,223,OK,N/A,OK,Consolidated 2 shipments for store 1250 [Single Temp (Cold): 2 stops],N/A
+Consolidated Overspill,ConsolidatedOvsp_4,Others,1,"1407 (AMB,CHI,FRE)",1407,36,No,53',Dual Temp,8.06,N/A,49,45,94,OK,N/A,OK,Consolidated 3 shipments for store 1407 [Front: 1 ambient stops | Rear: 2 cold stops],N/A
+Consolidated Overspill,ConsolidatedOvsp_5,Others,1,"1442 (AMB,CHI)",1442,191,No,53',Dual Temp,7.5,N/A,234,30,264,OK,N/A,OK,Consolidated 2 shipments for store 1442 [Front: 1 ambient stops | Rear: 1 cold stops],N/A
+Consolidated Overspill,ConsolidatedOvsp_6,Others,1,"1463 (AMB,CHI,FRE)",1463,193,No,53',Dual Temp,7,N/A,263,45,308,OK,N/A,OK,Consolidated 3 shipments for store 1463 [Front: 1 ambient stops | Rear: 2 cold stops],N/A
+Unplannable (Time),Time_1,Manual Review,1,1572 (AMB),1572,354,Yes,48',Single Temp,16.95,N/A,391,15,406,OK,N/A,OK,Failed due to delivery window constraints. [Single Temp (Ambient): 1 stops],N/A
+Overspill,Overspill_1,Others,2,1431 (AMB) / 1094 (AMB),1431 (23.3 mi) -> 1094,159,No,53',Single Temp,10.45,N/A,199,30,229,OK,N/A,OK, [Single Temp (Ambient): 2 stops],N/A
+Overspill,Overspill_2,Others,1,1503 (AMB),1503,412,No,53',Single Temp,7.5,N/A,459,15,474,OK,N/A,OK, [Single Temp (Ambient): 1 stops],N/A
+Overspill,Overspill_3,Others,3,1203 (FRE) / 1506 (FRE) / 1162 (FRE),1203 (5.3 mi) -> 1506 (14.1 mi) -> 1162,145,No,53',Single Temp,15.17,N/A,192,45,237,OK,N/A,OK, [Single Temp (Cold): 3 stops],N/A
+Overspill,Overspill_4,Others,2,1035 (FRE) / 1342 (FRE),1035 (6.9 mi) -> 1342,156,No,53',Single Temp,6.39,N/A,187,30,217,OK,N/A,OK, [Single Temp (Cold): 2 stops],N/A
+NFI,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $350.00,
+NFI,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $350.00,
+NFI,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $350.00,
+NFI,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $350.00,
+NFI,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $350.00,
+NFI,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $350.00,
+NFI,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $350.00,
+NFI,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $350.00,
+NFI,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $350.00,
+NFI,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $350.00,
+NFI,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $350.00,
+NFI,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $350.00,
+NFI,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $350.00,
+NFI,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $350.00,
+CRE,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $450.00,
+CRE,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $450.00,
+CRE,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $450.00,
+CRE,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $450.00,
+CRE,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $450.00,
+CRE,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $450.00,
+CRE,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $450.00,
+CRE,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $450.00,
+CRE,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $450.00,
+CRE,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $450.00,
+CRE,N/A,N/A,0,NOT PLANNED,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,NOTE: Carrier is valid but was not selected as the optimal choice. Cost not to use: $450.00,
+HB,N/A,N/A,0,UNUSED CAPACITY,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,Unused Capacity at Sat Dec 30 1899 19:00:00 GMT-0500 (Eastern Standard Time),
+HB,N/A,N/A,0,UNUSED CAPACITY,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,Unused Capacity at Sat Dec 30 1899 19:00:00 GMT-0500 (Eastern Standard Time),

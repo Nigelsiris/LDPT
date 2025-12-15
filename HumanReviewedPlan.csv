@@ -1,0 +1,44 @@
+Partially communicated,Circle Logistics,CIR_1ST_DT.04,1,1000,8004-8021-8007-8008,Sun 19:00,Late,11:46:00,"8004 (AMB,CHL,FRZ,PRO) / 8021 (FRZ) / 8007 (FRZ) / 8008 (FRZ)",23.32,"10,40,50,60,70",,3 TEMP,,,,429.8,86.40%,8008,00 No Violations
+C,,CIR_1ST_DT.05,1,1010,UNUSED,Sun 19:00,Late,0:00,UNUSED,0,,,,,,,0,0.00%,,00 No Violations
+C,,CRE_1ST_DT.03,1,840,UNUSED,Sun 19:00,Late,0:00,UNUSED,0,,,,,,,0,0.00%,,00 No Violations
+C,,CRE_1ST_DT.04,1,850,UNUSED,Sun 19:00,Late,0:00,UNUSED,0,,,,,,,0,0.00%,,00 No Violations
+Partially communicated,"C. R. England, Inc.",CRE_1ST_DT.05,1,860,1162-1203-1484,Sun 19:00,Late,7:16,"1162 (AMB,PRO) / 1203 (ALL) / 1484 (CHL)",29.17,"10,20,40,50,70,80",,,,,,175.7,100.00%,1484,00 No Violations
+Partially communicated,"C. R. England, Inc.",CRE_1ST_DT.08,1,890,1138-1250-1162,Sun 19:00,Late,8:30,"1138 (ALL) / 1250 (CHL,PRO) / 1162 (CHL)",25.91,"10,20,40,50,70,80",,,,,,210,96.00%,1162,00 No Violations
+Fully picked,"C. R. England, Inc.",CRE_1ST_DT.09,1,900,1407-1023-1081-1566-1352-1442,Sun 19:00,Late,10:06,"1407 (AMB,PRO) / 1023 (AMB,FRZ,PRO) / 1081 (FRZ) / 1566 (FRZ) / 1352 (FRZ) / 1442 (FRZ)",22.56,"10,60,70",,,,,,302.4,83.60%,1442,00 No Violations
+Partially communicated,"C. R. England, Inc.",CRE_1ST_DT.10,1,910,1094-1425-1177,Sun 19:00,Late,10:16,"1094 (AMB,PRO) / 1425 (ALL) / 1177 (CHL,PRO)",27.78,"10,20,40,50,70,80",,,,,,319.6,100.00%,1177,00 No Violations
+Partially communicated,"C. R. England, Inc.",CRE_1ST_DT.11,1,920,1443-1440,Sun 19:00,Late,9:47,1443 (ALL) / 1440 (CHL),16.76,"10,40,50,70",,,,,,338.1,62.10%,1440,00 No Violations
+Partially communicated,"C. R. England, Inc.",CRE_1ST_DT.14,1,950,1440-1581-1410-1567,Sun 19:00,Late,10:36,"1440 (PRO) / 1581 (AMB,PRO) / 1410 (AMB,PRO) / 1567 (AMB,FRZ,PRO)",23.23,"10,20,60,70,80",,,,,,366.7,86.00%,1567,00 No Violations
+Partially communicated,"C. R. England, Inc.",CRE_1ST_DT.16,1,1470,1564-1567-1410,Sun 19:00,Late,10:53,1564 (ALL) / 1567 (CHL) / 1410 (CHL),21.65,"10,20,40,50,70,80",,,,,,368.8,80.20%,1410,00 No Violations
+Partially communicated,"C. R. England, Inc.",CRE_1ST_DT.19,1,1580,1572-1576,Sun 19:00,Late,10:35,1572 (ALL) / 1576 (CHL),26.61,"10,20,40,50,70",,,,,,367.9,98.60%,1576,00 No Violations
+Fully picked,"C. R. England, Inc.",CRE_1ST_LG48.03,1,1360,1576-1572-1559,Sun 19:00,Late,10:21,"1576 (AMB,FRZ,PRO) / 1572 (FRZ) / 1559 (FRZ)",23,"10,60,70",,,,,,374.4,92.00%,1559,00 No Violations
+Partially communicated,Hirschbach,HB_1ST_DT.03,1,1590,1429-1434,Sun 19:00,Late,8:32,1429 (ALL) / 1434 (CHL),26.28,"10,20,40,50,70,80",,,,,,246.9,97.30%,1434,00 No Violations
+Partially communicated,Hirschbach,HB_1ST_DT.04,1,1600,1434-1433-1119,Sun 19:00,Late,10:06,"1434 (AMB,PRO) / 1433 (ALL) / 1119 (ALL)",26.08,"10,20,40,50,70,80",,,,,,304.5,96.60%,1119,00 No Violations
+Partially communicated,Hirschbach,HB_1ST_DT.05,1,1660,8006-8002,Sun 19:00,Late,10:46,8006 (ALL) / 8002 (ALL),20.78,"10,40,50,70",,,,,,402.6,77.00%,8002,00 No Violations
+C,,NFI_1ST_DT.01,1,1170,,Sun 19:00,Late,0:00,,0,,,,,,,0,0.00%,,00 No Violations
+Partially communicated,"NFI Interactive Logistics, LLC",NFI_1ST_LG.02,1,1640,1579-1580-8002-8006,Sun 19:00,Late,11:30,"1579 (AMB,FRZ,PRO) / 1580 (FRZ) / 8002 (FRZ) / 8006 (FRZ)",23,"10,20,60,70",,,,,,413.5,92.00%,8006,00 No Violations
+Fully picked,"NFI Interactive Logistics, LLC",NFI_1ST_LG36.01,1,1630,8017-1590,Sun 19:00,Late,10:17,"8017 (FRZ,PRO) / 1590 (FRZ)",13.56,"60,70",,,,,,412.2,71.40%,1590,00 No Violations
+Partially communicated,Schneider National Carriers,SCH_1ST_DT.04,1,1080,1580,Sun 19:00,Late,9:18,1580 (ALL),22.65,"10,20,40,50,70,80",,,,,,338,83.90%,1580,00 No Violations
+Partially communicated,Schneider National Carriers,SCH_1ST_DT.06,1,1100,8021-8017,Sun 19:00,Late,10:17,"8021 (AMB,PRO) / 8017 (AMB,CHL)",17.04,"10,20,40,50,70,80",,,,,,398.1,63.10%,8017,00 No Violations
+Partially communicated,Schneider National Carriers,SCH_1ST_DT.07,1,1110,1166-1129-1407,Sun 19:00,Late,6:40,1166 (AMB) / 1129 (ALL) / 1407 (CHL),22.17,"10,20,40,50,70,80",,,,,,188.4,82.10%,1407,00 No Violations
+C,,CRE_1ST_DT.17,1,1560,UNUSED,Sun 19:30,Late,0:00,UNUSED,0,,,,,,,0,0.00%,,00 No Violations
+Fully picked,Circle Logistics,CIR_1ST_DT.07,1,1530,1559,Sun 20:00,Late,9:03,1559 (ALL),14.04,"10,20,40,50,70,80",,,,,,354.6,52.00%,1559,00 No Violations
+C,,NFI_1ST_DT.10,1,1260,UNUSED,Sun 20:00,Late,0:00,UNUSED,0,,,,,,,0,0.00%,,00 No Violations
+C,,NFI_1ST_DT.11,1,1270,UNUSED,Sun 20:00,Late,0:00,UNUSED,0,,,,,,,0,0.00%,,00 No Violations
+C,,NFI_1ST_DT.12,1,1280,UNUSED,Sun 20:00,Late,0:00,UNUSED,0,,GRAB MISDELIVERED 1442 PRO FROM 1566,,,,,0,0.00%,,00 No Violations
+C,,NFI_1ST_DT.13,1,1290,UNUSED,Sun 20:00,Late,0:00,UNUSED,0,,,,,,,0,0.00%,,00 No Violations
+C,,NFI_1ST_DT.14,1,1300,UNUSED,Sun 20:00,Late,0:00,UNUSED,0,,,,,,,0,0.00%,,00 No Violations
+C,,NFI_1ST_LG.03,1,1650,UNUSED,Sun 20:00,Late,0:00,UNUSED,0,,,,,,,0,0.00%,,00 No Violations
+Partially communicated,Schneider National Carriers,SCH_1ST_36,1,1620,1590-1579,Sun 20:00,Late,9:50,1590 (ALL) / 1579 (CHL),9.39,"20,40,50,70,80",,,,,,380,49.40%,1579,00 No Violations
+Partially communicated,Schneider National Carriers,SCH_1ST_DT.11,1,1130,1342-1566-1442-1023,Sun 20:00,Late,10:45,1342 (ALL) / 1566 (PRO) / 1442 (PRO) / 1023 (CHL),18.54,"10,20,40,50,70,80",,,,,,365.1,68.70%,1023,00 No Violations
+Fully picked,"C. R. England, Inc.",CRE_1ST_DT.13,1,940,1499,Sun 21:00,Late,11:19,1499 (ALL),17.93,"10,20,40,50,70,80",,,,,,475.3,66.40%,1499,00 No Violations
+Fully picked,"NFI Interactive Logistics, LLC",NFI_1ST_DT.16,1,1320,8015-1564,Sun 21:00,Late,9:17,"8015 (AMB,FRZ) / 1564 (FRZ)",14.17,"10,20,60,80",,,,,,345.8,52.50%,1564,00 No Violations
+C,,NFI_1ST_DT.17,1,1330,UNUSED,Sun 21:00,Late,0:00,UNUSED,0,,,,,,,0,0.00%,,00 No Violations
+Fully picked,"NFI Interactive Logistics, LLC",NFI_1ST_DT.19,1,1350,UNUSED,Sun 21:00,Late,0:33,UNUSED,0,94,,,,,,0,0.00%,Standby(Overspill),00 No Violations
+Fully picked,"NFI Interactive Logistics, LLC",NFI_1ST_DT.20,1,1400,UNUSED,Sun 21:00,Late,0:33,UNUSED,0,94,,,,,,0,0.00%,Standby(Overspill),00 No Violations
+Fully picked,"NFI Interactive Logistics, LLC",NFI_1ST_DT.21,1,1410,UNUSED,Sun 21:00,Late,0:33,UNUSED,0,94,,,,,,0,0.00%,Standby(Overspill),00 No Violations
+Partially communicated,Schneider National Carriers,SCH_1ST_DT.08,1,1150,1463-1094,Sun 21:00,Late,7:16,1463 (ALL) / 1094 (CHL),21.54,"10,20,40,50,70,80",,,,,,198.8,79.80%,1094,00 No Violations
+Fully picked,Schneider National Carriers,SCH_1ST_DT.10,1,1120,1484-1352-1566-1081,Sun 21:00,Late,9:10,"1484 (AMB,PRO) / 1352 (AMB) / 1566 (ALL) / 1081 (CHL)",25.1,"10,20,40,50,70,80",,,,,,262.5,93.00%,1081,00 No Violations
+Partially communicated,Schneider National Carriers,SCH_1ST_DT.12,1,1140,1035-1545,Sun 21:00,Late,9:01,1035 (ALL) / 1545 (ALL),21.34,"10,20,40,50,70,80",,,,,,290.4,79.00%,1545,00 No Violations
+C,,CRE_1ST_DT.15,1,960,UNUSED,Sun 22:00,Late,0:00,UNUSED,0,,,,,,,0,0.00%,,00 No Violations
+C,,NFI_1ST_DT.05,1,1550,UNUSED,Sun 22:00,Late,0:00,UNUSED,0,,,,,,,0,0.00%,,00 No Violations
+Partially communicated,Circle Logistics,CIR_1ST_DT.06,1,1020,8007-8021-1561,Sun 23:00,Late,12:12,"8007 (ALL) / 8021 (CHL) / 1561 (AMB,CHL,FRZ,PRO)",24.28,"10,20,40,50,60,70,80",,,,,,415.9,89.90%,1561,00 No Violations

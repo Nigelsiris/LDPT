@@ -9,8 +9,8 @@
  * - Set mileage target at 85% of max (361 miles) with penalties for exceeding
  * - Reduced MAX_DISTANCE_BETWEEN_STOPS from 120 to 60 miles (hard limit 75 miles)
  *   to reduce miles between stops and create tighter routes
- * - Increased MIN_PALLETS_PER_ROUTE from 18 to 20 pallets to improve truck utilization
- * - Strengthened utilization penalty in scoring (2000 -> 5000) to discourage underutilized trucks
+ * - MIN_PALLETS_PER_ROUTE set to 18 to allow smaller runs when needed
+ * - Utilization penalty moderately strong (2000 -> 3500) to balance fill vs flexibility
  * - Increased cluster penalty (500 -> 800) to keep routes more geographically focused
  * - Reduced CLUSTER_FAILURE_THRESHOLD from 5 to 3 for tighter geographic clustering
  * - Increased MAX_PLANNING_ATTEMPTS from 3 to 5 to try harder before marking shipments as unplannable
@@ -57,11 +57,13 @@ const SettingsService = {
       MAX_ROUTE_MILEAGE: 425, // Reduced from 500 to 425 miles to ensure routes stay well below 450
       MAX_STOPS_GENERAL: 5,
       MAX_STOPS_NY: 3,
-      MAX_DISTANCE_BETWEEN_STOPS: 60, // Reduced from 120 to 60 miles for tighter routing
-      ABSOLUTE_MAX_DISTANCE_BETWEEN_STOPS: 75, // Reduced from 120 to 75 miles max leg
+      MAX_DISTANCE_BETWEEN_STOPS: 35, // REDUCED from 40 to 35 miles - stricter cross-region prevention
+      ABSOLUTE_MAX_DISTANCE_BETWEEN_STOPS: 45, // REDUCED from 50 to 45 miles - stricter hard limit
       MAX_ROUTE_DURATION_MINS: 720, // Pre-HOS duration limit
       ALLOW_ALL_ALL: true, // Enable ALL-ALL rule for ambient/chiller/produce
-      SMALL_AMBIENT_THRESHOLD: 6 // Allow up to 6 pallets when mixing ambient/produce with chiller
+      SMALL_AMBIENT_THRESHOLD: 8, // Allow up to 8 pallets when mixing ambient/produce with chiller
+      MIN_PALLETS_OVERSPILL_CLEANUP: 6, // REDUCED from 8 to 6 - allow smaller consolidations
+      MAX_CROSS_REGION_LEG_MILES: 70 // NEW - maximum leg distance to prevent cross-region routing
     };
     if (storedSettings) {
       try {
@@ -78,6 +80,157 @@ const SettingsService = {
     properties.setProperty('routingSettings', JSON.stringify(settings));
   }
 };
+
+// --- TOLL MATRIX INTEGRATION ---
+
+/**
+ * Loads the TollMatrix from the spreadsheet for cost calculations.
+ * @returns {Object} Toll matrix as nested object {fromStore: {toStore: tollCost}}
+ */
+function loadTollMatrix() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const tollSheet = ss.getSheetByName('TollMatrix');
+  if (!tollSheet) {
+    Logger.log('Warning: TollMatrix sheet not found. Toll costs will not be included.');
+    return {};
+  }
+  
+  const data = tollSheet.getDataRange().getValues();
+  if (data.length <= 1) return {};
+  
+  const headers = data[0];
+  const fromIdx = headers.indexOf('From');
+  const toIdx = headers.indexOf('To');
+  const tollCostIdx = headers.indexOf('TollCost');
+  
+  if (fromIdx === -1 || toIdx === -1 || tollCostIdx === -1) {
+    Logger.log('Warning: TollMatrix missing required columns (From, To, TollCost)');
+    return {};
+  }
+  
+  const tollMatrix = {};
+  for (let i = 1; i < data.length; i++) {
+    const from = String(data[i][fromIdx]);
+    const to = String(data[i][toIdx]);
+    const cost = parseFloat(data[i][tollCostIdx]) || 0;
+    
+    if (!tollMatrix[from]) tollMatrix[from] = {};
+    tollMatrix[from][to] = cost;
+  }
+  
+  Logger.log(`Loaded TollMatrix with ${Object.keys(tollMatrix).length} origins`);
+  return tollMatrix;
+}
+
+/**
+ * Gets regional classification for a store to detect cross-region routing.
+ * @param {string} store - Store number
+ * @param {Object} addressData - Address lookup data
+ * @returns {string} Region (East NY, West NY, NJ, Others)
+ */
+function getStoreRegion(store, addressData) {
+  const address = addressData[store];
+  if (!address) return 'Others';
+  
+  const cluster = address.cluster || '';
+  const city = (address.city || '').toUpperCase();
+  const state = (address.state || '').toUpperCase();
+  
+  // Use cluster if available
+  if (cluster && cluster !== 'Others') return cluster;
+  
+  // Fallback to state-based classification
+  if (state === 'NJ') return 'NJ';
+  if (state === 'NY') {
+    // Try to classify by city
+    const eastNYCities = ['BROOKLYN', 'QUEENS', 'JAMAICA', 'FLUSHING'];
+    const westNYCities = ['MANHATTAN', 'BRONX', 'STATEN ISLAND', 'YONKERS'];
+    
+    if (eastNYCities.some(c => city.includes(c))) return 'East NY';
+    if (westNYCities.some(c => city.includes(c))) return 'West NY';
+    
+    return 'NY'; // Generic NY if can't classify further
+  }
+  
+  return 'Others';
+}
+
+/**
+ * [NEW] Validates if stores can be grouped together based on ClusterData constraints.
+ * Each store has up to 4 valid clusters. If grouping stores from different clusters,
+ * ALL stores must be valid in at least ONE common cluster.
+ * @param {Array} stores - Array of store numbers to validate
+ * @param {object} clusterData - Cluster constraints from ClusterData sheet
+ * @returns {boolean} True if valid grouping, false otherwise
+ */
+function areStoresValidTogether(stores, clusterData) {
+  if (!stores || stores.length === 0) return true;
+  if (stores.length === 1) return true; // Single store always valid
+  
+  // Normalize all stores to strings
+  const uniqueStores = [...new Set(stores.map(s => String(s).trim()))];
+  if (uniqueStores.length === 1) return true;
+  
+  // If clusterData is empty or missing, log warning and allow (fallback)
+  if (!clusterData || Object.keys(clusterData).length === 0) {
+    Logger.log('WARNING: clusterData empty, cannot validate cluster compatibility for: ' + uniqueStores.join(', '));
+    return true; // Fallback to allow if no data
+  }
+  
+  // Get valid clusters for each store
+  const validClustersByStore = uniqueStores.map(store => {
+    const clusters = clusterData[store];
+    return clusters && clusters.length > 0 ? clusters : null;
+  });
+  
+  // Count how many stores have cluster data
+  const storesWithData = validClustersByStore.filter(c => c !== null).length;
+  
+  // If fewer than 2 stores have cluster data, we can't validate - allow but warn
+  if (storesWithData < 2) {
+    Logger.log('WARNING: Not enough cluster data to validate: ' + uniqueStores.join(', '));
+    return true;
+  }
+  
+  // Filter to only stores that have cluster data for intersection check
+  const clustersToCheck = validClustersByStore.filter(c => c !== null);
+  
+  // Find intersection - at least ONE cluster must be valid for ALL stores with data
+  const firstStoresClusters = new Set(clustersToCheck[0]);
+  for (let i = 1; i < clustersToCheck.length; i++) {
+    const storesClusters = new Set(clustersToCheck[i]);
+    const intersection = [...firstStoresClusters].filter(c => storesClusters.has(c));
+    if (intersection.length === 0) {
+      // No common cluster found
+      Logger.log('CLUSTER VIOLATION: No common cluster for stores. Clusters: ' + clustersToCheck.map((c,idx) => uniqueStores[idx] + '=' + c.join('/')).join(' vs '));
+      return false;
+    }
+    firstStoresClusters.clear();
+    intersection.forEach(c => firstStoresClusters.add(c));
+  }
+  
+  return firstStoresClusters.size > 0;
+}
+
+/**
+ * Reorders stops to place ambient/produce first and cold last for better cold chain compliance.
+ * @param {Array} stops - Array of stop objects
+ * @returns {Array} Reordered stops
+ */
+function enforceColdSafeOrdering(stops) {
+  if (!stops || stops.length <= 1) return stops;
+  const coldCategories = new Set(['CHI', 'FRE', 'PRO-CHILL', 'PRO-COLD', 'COLD']);
+  const ambientFirst = [];
+  const coldLast = [];
+  stops.forEach(s => {
+    if (coldCategories.has((s.category || '').toUpperCase())) {
+      coldLast.push(s);
+    } else {
+      ambientFirst.push(s);
+    }
+  });
+  return [...ambientFirst, ...coldLast];
+}
 
 /**
  * Gets the current routes that can be replanned.
@@ -198,26 +351,25 @@ function replanRoutes(routeIds) {
         stopSeq && stopSeq !== 'UNUSED CAPACITY' && 
         stopSeq !== 'NOT PLANNED' &&
         stopSeq !== 'N/A') {
-      const shipment = {
+      const context = {
         store: stopSeq,
         pallets: parseFloat(row[headers.indexOf('Total Pallets')]) || 0,
         category: row[headers.indexOf('Category')] || 'Ambient',
         palletType1: row[headers.indexOf('Pallet Type 1')] || '',
         palletType2: row[headers.indexOf('Pallet Type 2')] || '',
-        attempts: 0,
+        tollMatrix, // NEW - toll cost integration
         insertionFailures: 0
       };
       
       // Only add valid shipments
-      if (shipment.store && shipment.pallets > 0) {
-        shipmentsToReplan.push(shipment);
-        Logger.log(`Added shipment: ${JSON.stringify(shipment)}`);
+      if (context.store && context.pallets > 0) {
+        shipmentsToReplan.push(context);
+        Logger.log(`Added shipment: ${JSON.stringify(context)}`);
       } else {
-        Logger.log(`Skipped invalid shipment: ${JSON.stringify(shipment)}`);
+        Logger.log(`Skipped invalid shipment: ${JSON.stringify(context)}`);
       }
     }
   }
-  
   Logger.log(`Found ${shipmentsToReplan.length} shipments to replan`);
 
   if (shipmentsToReplan.length === 0) {
@@ -279,7 +431,7 @@ function replanRoutes(routeIds) {
     addressData,
     warehouse,
     OVERPLAN_FACTOR: 1.0,
-    MIN_PALLETS_PER_ROUTE: 20, // Increased from 15 to 20 for better utilization
+    MIN_PALLETS_PER_ROUTE: 18, // Slightly lower to allow flexibility on smaller runs
     MAX_PLANNING_ATTEMPTS: 5, // Increased attempts to try harder
     RELAX_MIN_ATTEMPTS: 4, // Require more attempts before relaxing
     RELAX_MIN_FACTOR: 0.8, // Less relaxation (was 0.7)
@@ -595,11 +747,12 @@ function getShipments(productTypeMap) {
     if (!store || !palletType1 || isNaN(pallets)) return;
     if (status === 'standby') return;
 
-    // Determine category
+    // Determine category (include Produce and Freezer explicitly)
     let category = 'Ambient';
     const palletTypeLower = String(palletType1).toLowerCase();
-    if (['chiller', 'meat'].includes(palletTypeLower)) category = 'Chiller';
-    else if (['freezer', 'freezertkt'].includes(palletTypeLower)) category = 'Freezer';
+    if (['freezer', 'frozen', 'freezertkt'].includes(palletTypeLower)) category = 'Freezer';
+    else if (['chiller', 'meat'].includes(palletTypeLower)) category = 'Chiller';
+    else if (['produce', 'fruit', 'vegetable', 'veg', 'greens'].some(k => palletTypeLower.includes(k))) category = 'Produce';
 
     // Get product type and create key
     const productTypeId = productTypeMap[palletType1] || null;
@@ -684,6 +837,57 @@ function getAddressData() {
   return addresses;
 }
 
+/**
+ * [NEW] Loads cluster data from ClusterData sheet for strict cluster validation.
+ * Each store has up to 4 valid clusters it can be paired with.
+ * @returns {object} Map of store -> [valid clusters]
+ */
+function getClusterData() {
+  // Try multiple possible sheet names
+  const possibleNames = ['ClusterData', 'PlanningTool2 - ClusterData', 'Cluster Data', 'Clusters'];
+  let values = null;
+  let foundName = null;
+  for (const name of possibleNames) {
+    values = getSheetData(name);
+    if (values && values.length > 1) {
+      foundName = name;
+      break;
+    }
+  }
+  if (!values || values.length <= 1) {
+    Logger.log('ERROR: ClusterData sheet not found. Tried: ' + possibleNames.join(', '));
+    return {};
+  }
+  Logger.log('Found ClusterData sheet: ' + foundName);
+
+  const headers = values[0]; // ["STORE NAME", "CLUSTER_1", "CLUSTER_2", "CLUSTER_3", "CLUSTER_4"]
+  const storeIdx = headers.indexOf('STORE NAME');
+  const clusters = {};
+  
+  values.slice(1).forEach(row => {
+    const storeName = String(row[storeIdx]).trim();
+    if (storeName) {
+      // Collect all non-empty cluster values for this store
+      const validClusters = [];
+      for (let i = 1; i < headers.length; i++) {
+        const clusterVal = row[i];
+        if (clusterVal && String(clusterVal).trim() !== '') {
+          validClusters.push(String(clusterVal).trim());
+        }
+      }
+      if (validClusters.length > 0) {
+        clusters[storeName] = validClusters;
+      }
+    }
+  });
+
+  Logger.log(`Loaded valid cluster assignments for ${Object.keys(clusters).length} stores`);
+  // Log first 5 entries for debugging
+  const sampleKeys = Object.keys(clusters).slice(0, 5);
+  sampleKeys.forEach(k => Logger.log(`  ClusterData[${k}] = [${clusters[k].join(', ')}]`));
+  return clusters;
+}
+
 // --- SHEET SETUP & UTILITY FUNCTIONS ---
 
 function setupPlanSheet() {
@@ -702,6 +906,178 @@ function setupPlanSheet() {
 }
 
 // --- DIAGNOSTICS ---
+
+function getPlanDiagnostics() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const planSheet = ss.getSheetByName('Generated Plan');
+  if (!planSheet) return null;
+
+  const data = planSheet.getDataRange().getValues();
+  if (data.length <= 1) return null;
+
+  const stats = { 
+    totalRoutes: 0, 
+    totalPallets: 0, 
+    totalMileage: 0, 
+    totalDuration: 0, 
+    hosViolations: 0, 
+    overMileage: 0, 
+    utilization: [],
+    mileageByRoute: []
+  };
+
+  const headers = data[0];
+  const palletsIdx = headers.indexOf('Total Pallets');
+  const milesIdx = headers.indexOf('Total Route Mileage');
+  const durationIdx = headers.indexOf('Total Duration (min)');
+  const hosIdx = headers.indexOf('HOS Status');
+  const utilIdx = headers.indexOf('Truck Utilization');
+  const mileageStatusIdx = headers.indexOf('Mileage Status');
+  const routeIdIdx = headers.indexOf('Route ID');
+
+  const parseNumber = (value) => {
+    if (typeof value === 'number') return value;
+    if (typeof value === 'string') {
+      const cleaned = value.replace(/[^0-9.-]/g, '');
+      const parsed = parseFloat(cleaned);
+      return isNaN(parsed) ? 0 : parsed;
+    }
+    return 0;
+  };
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    if (!row || String(row[0] || '').includes('Unplannable') || String(row[0] || '').includes('Overspill')) continue;
+    stats.totalRoutes++;
+    const pallets = parseNumber(row[palletsIdx]);
+    stats.totalPallets += pallets;
+    const routeMiles = parseNumber(row[milesIdx]);
+    stats.totalMileage += routeMiles;
+    stats.mileageByRoute.push({ routeId: row[routeIdIdx], miles: routeMiles });
+    stats.totalDuration += parseNumber(row[durationIdx]);
+    if (row[hosIdx] && row[hosIdx].toString().toUpperCase() !== 'OK') stats.hosViolations++;
+    const mileageStatus = mileageStatusIdx !== -1 ? String(row[mileageStatusIdx] || '').toUpperCase() : '';
+    if (mileageStatus === 'OVER') stats.overMileage++;
+    const utilStr = String(row[utilIdx] || '');
+    const utilPct = utilStr.endsWith('%') ? parseFloat(utilStr) / 100 : parseNumber(utilStr);
+    if (utilPct > 0 && utilPct <= 1.5) stats.utilization.push(utilPct);
+  }
+
+  const avgUtil = stats.utilization.length ? (stats.utilization.reduce((a,b)=>a+b,0)/stats.utilization.length) : 0;
+  const avgMileage = stats.totalRoutes ? (stats.totalMileage / stats.totalRoutes) : 0;
+
+  return {
+    totalRoutes: stats.totalRoutes,
+    totalPallets: stats.totalPallets,
+    totalMileage: stats.totalMileage,
+    avgMileage: avgMileage,
+    avgUtil: avgUtil,
+    overMileage: stats.overMileage,
+    hosViolations: stats.hosViolations
+  };
+}
+
+/**
+ * Validates generated plan for cluster consistency and leg distance violations.
+ * Logs warnings for routes that may have cross-cluster or excessive leg issues.
+ * @param {Sheet} planSheet - The Generated Plan sheet
+ * @param {object} context - Planning context with settings
+ */
+function validateAndReportPlanIssues(planSheet, context) {
+  Logger.log('=== POST-PLANNING VALIDATION ===');
+  
+  const { distanceMatrix, addressData, MAX_DISTANCE_BETWEEN_STOPS = 35, ABSOLUTE_MAX_DISTANCE_BETWEEN_STOPS = 45, MAX_CROSS_REGION_LEG_MILES = 70 } = context;
+  const planData = planSheet.getDataRange().getValues();
+  
+  if (!planData || planData.length <= 1) {
+    Logger.log('No routes to validate.');
+    return;
+  }
+  
+  const headers = planData[0];
+  const routeIdIdx = headers.indexOf('Route ID');
+  const stopSeqIdx = headers.indexOf('Stop Sequence');
+  const detailedRouteIdx = headers.indexOf('Detailed Route');
+  const clusterIdx = headers.indexOf('Cluster');
+  const mileageIdx = headers.indexOf('Total Route Mileage');
+  
+  let clusterWarnings = 0;
+  let legDistanceWarnings = 0;
+  let severeViolations = 0;
+  
+  for (let i = 1; i < planData.length; i++) {
+    const row = planData[i];
+    const routeId = row[routeIdIdx];
+    const stopSeq = row[stopSeqIdx];
+    const cluster = row[clusterIdx];
+    const mileage = parseFloat(row[mileageIdx]) || 0;
+    
+    // Skip non-route rows
+    if (!routeId || !stopSeq || stopSeq === 'UNUSED CAPACITY' || stopSeq === 'NOT PLANNED' || 
+        String(routeId).includes('Overspill') || String(routeId).includes('Unplannable')) {
+      continue;
+    }
+    
+    // Extract store numbers from stop sequence
+    const storePattern = /(\d{4})/g;
+    const stores = (stopSeq.match(storePattern) || []).filter((v, i, a) => a.indexOf(v) === i);
+    
+    if (stores.length === 0) continue;
+    
+    // Check 1: Cluster consistency
+    if (addressData) {
+      const storeClusters = stores.map(s => {
+        const region = getStoreRegion(s, addressData);
+        return region !== 'Others' ? region : (addressData[s] && addressData[s].cluster) || 'Others';
+      });
+      const uniqueClusters = [...new Set(storeClusters.filter(c => c !== 'Others'))];
+      
+      if (uniqueClusters.length > 1) {
+        clusterWarnings++;
+        Logger.log(`⚠️ CLUSTER WARNING: Route ${routeId} spans multiple clusters: ${uniqueClusters.join(', ')} | Stores: ${stores.join(' -> ')}`);
+      }
+    }
+    
+    // Check 2: Leg distances
+    if (distanceMatrix && stores.length >= 2) {
+      const legDistances = [];
+      
+      for (let j = 0; j < stores.length - 1; j++) {
+        const from = stores[j];
+        const to = stores[j + 1];
+        const distance = (distanceMatrix[from] && distanceMatrix[from][to] && distanceMatrix[from][to].distance) || 0;
+        
+        if (distance > 0) {
+          legDistances.push({ from, to, distance });
+          
+          if (distance > ABSOLUTE_MAX_DISTANCE_BETWEEN_STOPS) {
+            severeViolations++;
+            Logger.log(`🚨 SEVERE: Route ${routeId} has leg ${from} -> ${to}: ${distance} mi (exceeds ${ABSOLUTE_MAX_DISTANCE_BETWEEN_STOPS} mi hard limit)`);
+          } else if (distance > MAX_DISTANCE_BETWEEN_STOPS) {
+            legDistanceWarnings++;
+            Logger.log(`⚠️ LEG WARNING: Route ${routeId} has leg ${from} -> ${to}: ${distance} mi (exceeds preferred ${MAX_DISTANCE_BETWEEN_STOPS} mi)`);
+          }
+        }
+      }
+      
+      const maxLeg = legDistances.length > 0 ? Math.max(...legDistances.map(l => l.distance)) : 0;
+      if (maxLeg > MAX_CROSS_REGION_LEG_MILES) {
+        Logger.log(`⚠️ CROSS-REGION: Route ${routeId} max leg ${maxLeg} mi exceeds cross-region threshold ${MAX_CROSS_REGION_LEG_MILES} mi`);
+      }
+    }
+  }
+  
+  Logger.log('=== VALIDATION SUMMARY ===');
+  Logger.log(`Cluster Warnings: ${clusterWarnings}`);
+  Logger.log(`Leg Distance Warnings: ${legDistanceWarnings}`);
+  Logger.log(`Severe Violations (exceeding hard limit): ${severeViolations}`);
+  
+  if (severeViolations > 0) {
+    Logger.log('🚨 CRITICAL: Some routes have legs exceeding the hard distance limit. Review and replan these routes.');
+  }
+  
+  Logger.log('=== END VALIDATION ===');
+}
 
 function generateDiagnosticReport(planSheet, settings) {
   try {
@@ -815,6 +1191,130 @@ function isTimeInWindow(routeTimeStr, windowStr) {
 }
 
 /**
+ * [NEW] Validates cold chain compliance for a route's stop sequence.
+ * Cold chain requires:
+ * 1. No loss of temperature control
+ * 2. Cold items must be protected during load/unload
+ * 3. Unload sequence must keep cold items cold (cold items last in unload order)
+ * @param {Array} stops - Array of stop objects
+ * @param {object} context - Planning context
+ * @returns {boolean} true if cold chain is compliant
+ */
+function validateColdChainCompliance(stops, context) {
+  if (!stops || stops.length <= 1) return true;
+
+  // Categorize stops
+  const hasCold = stops.some(s => s.category === 'Chiller' || s.category === 'Freezer');
+  const hasAmbient = stops.some(s => s.category === 'Ambient' || s.category === 'Produce');
+
+  // If only cold or only ambient, always compliant
+  if (!hasCold || !hasAmbient) return true;
+
+  // For mixed loads: cold items must be unloaded last, so cold deliveries should occur after ambient stops
+  const uniqueStores = [...new Set(stops.map(s => s.store))];
+  
+  let firstColdStoreIndex = uniqueStores.length;
+  let lastAmbientStoreIndex = -1;
+
+  // Find first store with cold items and last store with ambient items
+  for (let i = 0; i < uniqueStores.length; i++) {
+    const store = uniqueStores[i];
+    const storeStops = stops.filter(s => s.store === store);
+    
+    if (storeStops.some(s => s.category === 'Chiller' || s.category === 'Freezer')) {
+      if (i < firstColdStoreIndex) firstColdStoreIndex = i;
+    }
+    
+    if (storeStops.some(s => s.category === 'Ambient' || s.category === 'Produce')) {
+      lastAmbientStoreIndex = i;
+    }
+  }
+
+  // Cold chain compliant if: all cold stops come after the last ambient stop (or same store)
+  // This keeps cold product at the rear and unloads it last
+  if (firstColdStoreIndex >= lastAmbientStoreIndex) {
+    return true; // Cold items unloaded after ambient items (compliant)
+  }
+
+  return false; // Ambient items loaded after cold (violates cold chain)
+}
+
+/**
+ * [NEW] Allocates temperature zones on the trailer for the given stops.
+ * Returns zone allocation information for route optimization.
+ * @param {Array} stops - Route stops
+ * @returns {object} Zone allocation {frontZone, rearZone, info}
+ */
+function allocateTemperatureZones(stops) {
+  if (!stops || stops.length === 0) {
+    return { frontZone: [], rearZone: [], info: 'Empty route' };
+  }
+
+  // Separate by category
+  const cold = stops.filter(s => s.category === 'Chiller' || s.category === 'Freezer');
+  const ambient = stops.filter(s => s.category === 'Ambient' || s.category === 'Produce');
+
+  // Allocation strategy: Cold items in rear (loaded last), ambient in front (loaded first)
+  if (cold.length > 0 && ambient.length > 0) {
+    return {
+      frontZone: ambient,
+      rearZone: cold,
+      info: `Front: ${ambient.length} ambient stops | Rear: ${cold.length} cold stops`
+    };
+  } else if (cold.length > 0) {
+    return {
+      frontZone: [],
+      rearZone: cold,
+      info: `Single Temp (Cold): ${cold.length} stops`
+    };
+  } else {
+    return {
+      frontZone: ambient,
+      rearZone: [],
+      info: `Single Temp (Ambient): ${ambient.length} stops`
+    };
+  }
+}
+
+/**
+ * [NEW] Optimizes stop order considering both cold chain and geography.
+ * Ensures ambient stops are served before cold stops when mixed.
+ * @param {Array} stops - Unoptimized stops
+ * @param {string} warehouse - Warehouse location
+ * @param {object} distanceMatrix - Distance matrix
+ * @returns {Array} Cold-chain-compliant optimized stops
+ */
+function coldChainOptimizeStopOrder(stops, warehouse, distanceMatrix) {
+  if (stops.length <= 1) return stops;
+
+  // Separate by category
+  const cold = [];
+  const ambient = [];
+  
+  stops.forEach(s => {
+    if (s.category === 'Chiller' || s.category === 'Freezer') {
+      cold.push(s);
+    } else {
+      ambient.push(s);
+    }
+  });
+
+  // If no mixing, use standard optimization
+  if (cold.length === 0 || ambient.length === 0) {
+    return advancedOptimizeStopOrder(stops, warehouse, distanceMatrix);
+  }
+
+  // For mixed loads: ambient first, then cold (for cold chain compliance)
+  const optimizedAmbient = advancedOptimizeStopOrder(ambient, warehouse, distanceMatrix);
+  const lastAmbientStore = optimizedAmbient.length > 0 ? 
+    optimizedAmbient[optimizedAmbient.length - 1].store : warehouse;
+  
+  const optimizedCold = advancedOptimizeStopOrder(cold, lastAmbientStore, distanceMatrix);
+
+  return [...optimizedAmbient, ...optimizedCold];
+}
+
+/**
  * Determines if a set of product categories can co-load on a single trailer.
  * Default: disallow Chiller + Freezer together.
  * New behavior: allow ALL-ALL mixes when all stores/categories are identical or when
@@ -858,18 +1358,66 @@ function isTempCompatible(requiredCategories, options) {
 }
 
 function formatStopSequence(stops) {
-  const stopsByStore = {};
-  stops.forEach(stop => {
-    if (!stopsByStore[stop.store]) stopsByStore[stop.store] = new Set();
-    stopsByStore[stop.store].add(stop.category);
+  const perStore = {};
+  stops.forEach(s => {
+    if (!perStore[s.store]) perStore[s.store] = { Ambient: 0, Produce: 0, Chiller: 0, Freezer: 0 };
+    const cat = s.category || 'Ambient';
+    const pallets = parseFloat(s.pallets) || 0;
+    if (cat === 'Ambient') perStore[s.store].Ambient += pallets;
+    else if (cat === 'Produce') perStore[s.store].Produce += pallets;
+    else if (cat === 'Chiller') perStore[s.store].Chiller += pallets;
+    else if (cat === 'Freezer') perStore[s.store].Freezer += pallets;
   });
   const uniqueStoresInOrder = [...new Set(stops.map(s => s.store))];
   return uniqueStoresInOrder.map(store => {
-    const catAbbr = [...stopsByStore[store]].map(c => c.substring(0, 3).toUpperCase()).join(',');
-    return `${store} (${catAbbr})`;
+    const counts = perStore[store] || { Ambient: 0, Produce: 0, Chiller: 0, Freezer: 0 };
+    const parts = [];
+    if (counts.Ambient > 0) parts.push(`AMB:${counts.Ambient.toFixed(2)}`);
+    if (counts.Produce > 0) parts.push(`PRO:${counts.Produce.toFixed(2)}`);
+    if (counts.Chiller > 0) parts.push(`CHI:${counts.Chiller.toFixed(2)}`);
+    if (counts.Freezer > 0) parts.push(`FRE:${counts.Freezer.toFixed(2)}`);
+    return `${store} (${parts.join(', ')})`;
   }).join(' / ');
 }
+/**
+ * Formats stop sequence for display, showing "(ALL)" if all categories present,
+ * or abbreviated category list like "(AMB,CHI)" for some categories.
+ */
+function formatStopSequence(stops) {
+  const perStore = {};
+  stops.forEach(s => {
+    if (!perStore[s.store]) perStore[s.store] = { Ambient: 0, Produce: 0, Chiller: 0, Freezer: 0 };
+    const cat = s.category || 'Ambient';
+    const pallets = parseFloat(s.pallets) || 0;
+    if (cat === 'Ambient') perStore[s.store].Ambient += pallets;
+    else if (cat === 'Produce') perStore[s.store].Produce += pallets;
+    else if (cat === 'Chiller') perStore[s.store].Chiller += pallets;
+    else if (cat === 'Freezer') perStore[s.store].Freezer += pallets;
+  });
+  const uniqueStoresInOrder = [...new Set(stops.map(s => s.store))];
+  return uniqueStoresInOrder.map(store => {
+    const counts = perStore[store] || { Ambient: 0, Produce: 0, Chiller: 0, Freezer: 0 };
+    const hasAMB = counts.Ambient > 0;
+    const hasPRO = counts.Produce > 0;
+    const hasCHL = counts.Chiller > 0;
+    const hasFRZ = counts.Freezer > 0;
 
+    let suffix;
+    // ALL means AMB + CHL + PRO only (no FRZ)
+    if (hasAMB && hasCHL && hasPRO && !hasFRZ) {
+      suffix = '(ALL)';
+    } else {
+      const cats = [];
+      if (hasAMB) cats.push('AMB');
+      if (hasFRZ) cats.push('FRZ');
+      if (hasPRO) cats.push('PRO');
+      if (hasCHL && !hasFRZ) cats.push('CHL'); // If FRZ present, CHL implied; omit CHL to match requested style
+      suffix = cats.length ? `(${cats.join(',')})` : '(EMPTY)';
+    }
+
+    return `${store} ${suffix}`;
+  }).join(' / ');
+}
 
 // --- CORE ROUTING & PLANNING LOGIC ---
 
@@ -886,7 +1434,7 @@ function generatePlan() {
   
   const planSheet = setupPlanSheet();
   
-  let shipments, allCarriers, restrictions, detailedDurations, addressData, distanceMatrix;
+  let shipments, allCarriers, restrictions, detailedDurations, addressData, distanceMatrix, tollMatrix, clusterData;
   try {
     Logger.log('Starting data collection...');
     const productTypeMap = getProductTypeMap();
@@ -917,6 +1465,13 @@ function generatePlan() {
     Logger.log('Starting distance matrix calculation...');
     distanceMatrix = getDistanceMatrix(shipments, addressData, WAREHOUSE_LOCATION, API_KEY);
     
+    Logger.log('Loading TollMatrix for cost calculations...');
+    tollMatrix = loadTollMatrix();
+    
+    Logger.log('Loading cluster validation data...');
+    clusterData = getClusterData();
+    Logger.log('Got cluster validation data');
+    
     // Assign clusters and initialize insertion failures
     Logger.log('Assigning clusters to shipments...');
     shipments.forEach(s => {
@@ -924,7 +1479,13 @@ function generatePlan() {
         Logger.log(`Warning: Invalid shipment found: ${JSON.stringify(s)}`);
         return;
       }
-      s.cluster = (addressData[s.store] && addressData[s.store].cluster) || 'Others';
+      const existingCluster = (addressData[s.store] && addressData[s.store].cluster) || 'Others';
+      // NEW: Auto-classify region if cluster is missing to improve geographic grouping
+      const inferredRegion = getStoreRegion(s.store, addressData);
+      s.cluster = existingCluster === 'Others' ? inferredRegion : existingCluster;
+      if (addressData[s.store]) {
+        addressData[s.store].cluster = s.cluster; // persist inferred cluster for downstream logic
+      }
       if (s.insertionFailures === undefined) s.insertionFailures = 0;
     });
   } catch (e) {
@@ -939,13 +1500,16 @@ function generatePlan() {
     detailedDurations,
     distanceMatrix,
     addressData,
+    clusterData,
+    tollMatrix, // NEW - toll cost integration
     warehouse: WAREHOUSE_LOCATION,
     OVERPLAN_FACTOR: 1.0,
-    MIN_PALLETS_PER_ROUTE: 20, // Increased from 18 to 20 for better utilization
+    MIN_PALLETS_PER_ROUTE: 18, // Slightly lower to allow flexibility on smaller runs
     MAX_PLANNING_ATTEMPTS: 5, // Increased attempts to try harder
     RELAX_MIN_ATTEMPTS: 4, // Require more attempts before relaxing
     RELAX_MIN_FACTOR: 0.8, // Less relaxation (was 0.7)
-    CLUSTER_FAILURE_THRESHOLD: 3, // Reduced from 5 to 3 to keep routes more clustered
+    CLUSTER_FAILURE_THRESHOLD: 5, // Stricter clustering to prevent cross-region routing
+    MIN_PALLETS_OVERSPILL_CLEANUP: settings.MIN_PALLETS_OVERSPILL_CLEANUP || 6 // NEW - reduced for better consolidation
   };
   
   let carriersForPlanning = JSON.parse(JSON.stringify(allCarriers));
@@ -1000,6 +1564,13 @@ function generatePlan() {
 
   updateDashboard();
 
+  // NEW: Validate plan for cluster consistency and leg distance violations
+  try { 
+    validateAndReportPlanIssues(planSheet, context);
+  } catch(e) { 
+    Logger.log('Validation error: '+e); 
+  }
+
   // Generate diagnostics after plan build
   try { generateDiagnosticReport(planSheet, settings); } catch(e) { Logger.log('Diagnostics error: '+e); }
 
@@ -1015,11 +1586,13 @@ function runPlanningLoop(shipmentsToPlan, availableCarriers, context, planSheet,
         restrictions,
         RELAX_MIN_ATTEMPTS = 2,
         RELAX_MIN_FACTOR = 0.7,
-        CLUSTER_FAILURE_THRESHOLD = 2
+        CLUSTER_FAILURE_THRESHOLD = 5  // INCREASED from 2-3 to 5 for stricter clustering
     } = context;
     let routes = []; // Track all created routes for rebalancing
 
     let planningInProgress = true;
+    let passNumber = 1; // Track planning pass for logging
+    
     while (planningInProgress) {
         unassignedShipments.sort((a, b) => b.pallets - a.pallets);
         
@@ -1053,7 +1626,7 @@ function runPlanningLoop(shipmentsToPlan, availableCarriers, context, planSheet,
             insertedIndices.forEach(idx => unassignedShipments.splice(idx, 1));
             
             if (insertedIndices.length > 0) {
-                Logger.log(`Inserted ${insertedIndices.length} shipments into existing routes`);
+                Logger.log(`[Pass ${passNumber}] Inserted ${insertedIndices.length} shipments into existing routes`);
             }
         }
         
@@ -1068,6 +1641,7 @@ function runPlanningLoop(shipmentsToPlan, availableCarriers, context, planSheet,
                 });
             }
             planningInProgress = false;
+            passNumber++;
             continue;
         }
 
@@ -1084,6 +1658,7 @@ function runPlanningLoop(shipmentsToPlan, availableCarriers, context, planSheet,
                 seedShipment.failureReason = 'No Viable Carrier';
             }
             unassignedShipments.push(seedShipment);
+            passNumber++;
             continue;
         }
 
@@ -1099,8 +1674,14 @@ function runPlanningLoop(shipmentsToPlan, availableCarriers, context, planSheet,
                 if (candidate.failureReason) continue;
                 if (candidate.insertionFailures === undefined) candidate.insertionFailures = 0;
 
+                // STRICTER CLUSTER ENFORCEMENT:
+                // Only allow different clusters after many insertion failures or seed attempts
                 const differentCluster = currentRoute.cluster !== 'Others' && candidate.cluster !== currentRoute.cluster;
-                const canRelaxCluster = differentCluster && (candidate.insertionFailures >= CLUSTER_FAILURE_THRESHOLD || currentRoute.seedAttempts >= RELAX_MIN_ATTEMPTS);
+                const canRelaxCluster = differentCluster && (
+                    candidate.insertionFailures >= CLUSTER_FAILURE_THRESHOLD || 
+                    currentRoute.seedAttempts >= 4 // Require higher seed attempts before allowing
+                );
+                
                 if (differentCluster && !canRelaxCluster) {
                     candidate.insertionFailures++;
                     continue;
@@ -1139,6 +1720,8 @@ function runPlanningLoop(shipmentsToPlan, availableCarriers, context, planSheet,
             currentRoute.routeId = `${currentRoute.carrier.name.replace(/\s+/g, '')}_${iteration++}`;
             routes.push(currentRoute); // Add to routes array instead of writing immediately
         }
+        
+        passNumber++;
     }
     
     // After main loop, try to utilize any remaining carriers with pull-forward requests
@@ -1179,7 +1762,11 @@ function checkAndScoreInsertion(shipment, route, context, log, iter) {
     MAX_ROUTE_MILEAGE,
     MAX_STOPS_GENERAL,
     MAX_DISTANCE_BETWEEN_STOPS,
-    ABSOLUTE_MAX_DISTANCE_BETWEEN_STOPS
+    ABSOLUTE_MAX_DISTANCE_BETWEEN_STOPS,
+    MAX_CROSS_REGION_LEG_MILES = 70, // NEW - cross-region threshold
+    MILEAGE_BUFFER = 0.95, // 95% hard limit buffer
+    addressData,
+    tollMatrix
   } = context;
 
   // Validate input parameters
@@ -1189,7 +1776,44 @@ function checkAndScoreInsertion(shipment, route, context, log, iter) {
   }
 
   const tempStops = [...route.stops, shipment];
-  if ([...new Set(tempStops.map(s => s.store))].length > MAX_STOPS_GENERAL) return null;
+  const uniqueStores = [...new Set(tempStops.map(s => s.store))];
+  if (uniqueStores.length > MAX_STOPS_GENERAL) return null;
+  
+   // NEW: Validate cluster compatibility - each store must belong to at least one common cluster
+   if (context.clusterData && !areStoresValidTogether(uniqueStores, context.clusterData)) {
+     return null;
+   }
+
+  // Region-aware stop cap: NYC-specific clusters limited to 2 stops; others allow up to 4
+  if (addressData) {
+    const nycClusters = new Set(['East NY', 'West NY', 'NY', 'UpperMidLG', 'UpperEastLG', 'LowerMidLG', 'LGMain', 'LowerEastLG']);
+    const regions = uniqueStores.map(s => getStoreRegion(s, addressData));
+    const allNYC = regions.length > 0 && regions.every(r => nycClusters.has(r));
+    if (allNYC && uniqueStores.length > 2) return null;
+  }
+
+  // NEW: Check for cross-region routing violations
+  if (addressData) {
+    const regions = tempStops.map(s => getStoreRegion(s.store, addressData));
+    const uniqueRegions = [...new Set(regions.filter(r => r !== 'Others'))];
+    
+    // If we have multiple distinct regions (e.g., NY and NJ), check leg distances more strictly
+    if (uniqueRegions.length > 1) {
+      // Calculate leg distances to check if cross-region legs are too long
+      const tempOptimizedForRegionCheck = advancedOptimizeStopOrder(tempStops, warehouse, distanceMatrix);
+      const legDetails = getLegDistanceDetails(tempOptimizedForRegionCheck, distanceMatrix);
+      
+      if (!legDetails.hasMissingData && legDetails.legDistances.length > 0) {
+        const maxLeg = Math.max(...legDetails.legDistances);
+        
+        // Reject if cross-region leg exceeds threshold
+        if (maxLeg > MAX_CROSS_REGION_LEG_MILES) {
+          Logger.log(`Rejected cross-region route: ${uniqueRegions.join(' + ')} with max leg ${maxLeg} miles`);
+          return null;
+        }
+      }
+    }
+  }
 
   // Build per-store category pallet counts for the small-ambient override
   const perStoreCounts = {};
@@ -1199,6 +1823,9 @@ function checkAndScoreInsertion(shipment, route, context, log, iter) {
   });
 
   if (!isTempCompatible(new Set(tempStops.map(s => s.category)), { allowAllAll: context.ALLOW_ALL_ALL || false, smallAmbientThreshold: context.SMALL_AMBIENT_THRESHOLD || 4, details: { perStoreCounts } })) return null;
+
+  // Check cold chain compliance (new validation)
+  if (!validateColdChainCompliance(tempStops, context)) return null;
 
   if (restrictions[shipment.store] && restrictions[shipment.store].deliveryWindow && restrictions[shipment.store].deliveryWindow.trim() !== '' && restrictions[shipment.store].deliveryWindow.toUpperCase() !== 'N/A' && !isTimeInWindow(route.time, restrictions[shipment.store].deliveryWindow)) return null;
 
@@ -1215,7 +1842,7 @@ function checkAndScoreInsertion(shipment, route, context, log, iter) {
   if (!capacity || (route.totalPallets || 0) + shipment.pallets > (capacity * OVERPLAN_FACTOR)) return null;
 
   const currentOptimized = advancedOptimizeStopOrder(route.stops, warehouse, distanceMatrix);
-  const tempOptimized = advancedOptimizeStopOrder(tempStops, warehouse, distanceMatrix);
+  let tempOptimized = advancedOptimizeStopOrder(tempStops, warehouse, distanceMatrix);
   const preferredLegThreshold = MAX_DISTANCE_BETWEEN_STOPS || 50;
   const hardLegLimit = ABSOLUTE_MAX_DISTANCE_BETWEEN_STOPS || Math.max(75, preferredLegThreshold);
 
@@ -1226,26 +1853,393 @@ function checkAndScoreInsertion(shipment, route, context, log, iter) {
   if (proposedLegDetails.hasMissingData) return null;
 
   const proposedMaxLeg = proposedLegDetails.legDistances.length > 0 ? Math.max(...proposedLegDetails.legDistances) : 0;
-  if (proposedMaxLeg > hardLegLimit) return null;
+  if (proposedMaxLeg > hardLegLimit) {
+    Logger.log(`Rejected insertion: max leg ${proposedMaxLeg} mi exceeds hard limit ${hardLegLimit} mi`);
+    return null;
+  }
+  
+  // NEW: Also reject if any leg exceeds MAX_CROSS_REGION_LEG_MILES (stricter check)
+  if (MAX_CROSS_REGION_LEG_MILES && proposedMaxLeg > MAX_CROSS_REGION_LEG_MILES) {
+    Logger.log(`Rejected insertion: max leg ${proposedMaxLeg} mi exceeds cross-region limit ${MAX_CROSS_REGION_LEG_MILES} mi`);
+    return null;
+  }
 
   const distancePenaltyDelta = calculateDistancePenalty(proposedLegDetails.legDistances, preferredLegThreshold)
     - calculateDistancePenalty(currentLegDetails.legDistances, preferredLegThreshold);
 
+  // NEW: If cold chain would fail, try a cold-safe ordering (ambient-first, cold-last)
+  if (!validateColdChainCompliance(tempOptimized, context)) {
+    const coldSafe = enforceColdSafeOrdering(tempOptimized);
+    const coldSafeMetrics = calculateRouteMetricsWithHOS(coldSafe, warehouse, distanceMatrix, context.detailedDurations);
+    if (coldSafeMetrics.totalDistance <= MAX_ROUTE_MILEAGE * MILEAGE_BUFFER) {
+      tempOptimized = coldSafe;
+    }
+  }
+
   const tempMetrics = calculateRouteMetricsWithHOS(tempOptimized, warehouse, distanceMatrix, context.detailedDurations);
-  if (tempMetrics.totalDistance > MAX_ROUTE_MILEAGE || tempMetrics.hosStatus !== 'OK') return null;
+  
+  // STRICT MILEAGE ENFORCEMENT: Hard reject if exceeds mileage cap with buffer
+  const mileageHardLimit = MAX_ROUTE_MILEAGE * MILEAGE_BUFFER;
+  if (tempMetrics.totalDistance > mileageHardLimit) {
+    return null; // Hard reject - mileage constraint violated
+  }
+  
+  if (tempMetrics.hosStatus !== 'OK') return null;
 
   const originalMetrics = calculateRouteMetricsWithHOS(currentOptimized, warehouse, distanceMatrix, context.detailedDurations);
 
   const newCost = (tempMetrics.totalDistance * carrier.costPerMile) + carrier.costPerRoute;
   const oldCost = (originalMetrics.totalDistance * carrier.costPerMile) + carrier.costPerRoute;
+  
+  // NEW: Add toll costs if TollMatrix available
+  let tollDelta = 0;
+  if (tollMatrix) {
+    const newTollCost = calculateRouteTollCost(tempOptimized, warehouse, tollMatrix);
+    const oldTollCost = calculateRouteTollCost(currentOptimized, warehouse, tollMatrix);
+    tollDelta = newTollCost - oldTollCost;
+  }
 
-  return (newCost - oldCost) + distancePenaltyDelta; // Return cost delta adjusted for leg distance penalties
+  return (newCost - oldCost) + distancePenaltyDelta + tollDelta; // Return cost delta with tolls
+}
+
+/**
+ * [NEW] Calculates total toll cost for a route using TollMatrix.
+ * @param {Array} stops - Ordered stops in the route
+ * @param {Object} warehouse - Warehouse location
+ * @param {Object} tollMatrix - Toll matrix {from: {to: cost}}
+ * @returns {number} Total toll cost for the route
+ */
+function calculateRouteTollCost(stops, warehouse, tollMatrix) {
+  if (!tollMatrix || Object.keys(tollMatrix).length === 0) return 0;
+  
+  let totalTollCost = 0;
+  const warehouseId = String(warehouse.store || 'WH');
+  
+  // Warehouse to first stop
+  if (stops.length > 0) {
+    const firstStop = String(stops[0].store);
+    if (tollMatrix[warehouseId] && tollMatrix[warehouseId][firstStop]) {
+      totalTollCost += tollMatrix[warehouseId][firstStop];
+    }
+  }
+  
+  // Between stops
+  for (let i = 0; i < stops.length - 1; i++) {
+    const from = String(stops[i].store);
+    const to = String(stops[i + 1].store);
+    if (tollMatrix[from] && tollMatrix[from][to]) {
+      totalTollCost += tollMatrix[from][to];
+    }
+  }
+  
+  // Last stop back to warehouse
+  if (stops.length > 0) {
+    const lastStop = String(stops[stops.length - 1].store);
+    if (tollMatrix[lastStop] && tollMatrix[lastStop][warehouseId]) {
+      totalTollCost += tollMatrix[lastStop][warehouseId];
+    }
+  }
+  
+  return totalTollCost;
+}
+
+/**
+ * Promotes consolidated overspill routes to main routes if they meet validation criteria.
+ * - Must pass isRouteValid checks (region stop limits, mileage, HOS)
+ * - Can have 2+ stops in non-NYC clusters; 2 stops max in NYC clusters
+ * - Returns the promoted routes and removes them from consolidatedRoutes array
+ */
+function promoteValidConsolidatedOverspill(consolidatedRoutes, context) {
+  if (!consolidatedRoutes || consolidatedRoutes.length === 0) return [];
+  
+  const promotedRoutes = [];
+  const indicesToRemove = [];
+  
+  consolidatedRoutes.forEach((consolidation, idx) => {
+    // Build a mock route object for validation
+    const mockRoute = {
+      carrier: { name: 'DummyCarrier', pallets53: 26, pallets48: 22, pallets36: 18, costPerMile: 0, costPerRoute: 0 },
+      stops: consolidation.stops,
+      totalPallets: consolidation.totalPallets,
+      cluster: consolidation.cluster
+    };
+    
+    // Check if this route passes validation
+    if (isRouteValid(mockRoute, context)) {
+      // Calculate metrics to ensure mileage is within limits
+      const metrics = calculateRouteMetricsWithHOS(
+        consolidation.stops,
+        context.warehouse,
+        context.distanceMatrix,
+        context.detailedDurations
+      );
+      
+      if (metrics.totalDistance <= (context.MAX_ROUTE_MILEAGE || 425)) {
+        // This consolidated overspill is valid for promotion
+        mockRoute.routeId = `PromovedOvsp_${idx + 1}`;
+        promotedRoutes.push(mockRoute);
+        indicesToRemove.push(idx);
+        Logger.log(`Promoting ConsolidatedOvsp_${idx + 1}: ${consolidation.stops.length} stops, ${consolidation.totalPallets.toFixed(2)} pallets, ${metrics.totalDistance.toFixed(1)} mi`);
+      }
+    }
+  });
+  
+  // Remove promoted routes from consolidatedRoutes (in reverse order to avoid index issues)
+  indicesToRemove.reverse().forEach(idx => {
+    consolidatedRoutes.splice(idx, 1);
+  });
+  
+  return promotedRoutes;
+}
+
+/**
+ * [ENHANCED] Consolidates overspill shipments more aggressively.
+ * Groups by store and nearby geography to minimize overspill count.
+ */
+function consolidateOverspillShipments(overspillShipments, context) {
+  if (!overspillShipments || overspillShipments.length === 0) return [];
+  
+  const { MIN_PALLETS_OVERSPILL_CLEANUP, addressData, distanceMatrix } = context;
+  
+  // Group shipments by store first
+  const byStore = {};
+  overspillShipments.forEach(s => {
+    if (!byStore[s.store]) byStore[s.store] = [];
+    byStore[s.store].push(s);
+  });
+  
+  // Consolidate same-store shipments into multi-temp routes
+  let consolidatedRoutes = [];
+  Object.keys(byStore).forEach(store => {
+    const storeShipments = byStore[store];
+    if (storeShipments.length > 1) {
+      // Multiple categories for same store - consolidate
+      const totalPallets = storeShipments.reduce((sum, s) => sum + s.pallets, 0);
+      // More aggressive consolidation - even if below cleanup threshold
+      if (totalPallets >= MIN_PALLETS_OVERSPILL_CLEANUP * 0.75) { // 75% of threshold
+        consolidatedRoutes.push({
+          stops: storeShipments,
+          totalPallets: totalPallets,
+          cluster: storeShipments[0].cluster || 'Others',
+          reason: `Consolidated ${storeShipments.length} shipments for store ${store}`
+        });
+        // Remove from overspill list
+        storeShipments.forEach(s => {
+          const idx = overspillShipments.indexOf(s);
+          if (idx >= 0) overspillShipments.splice(idx, 1);
+        });
+      }
+    }
+  });
+  
+  // NEW: Try to group nearby small overspill shipments (within 25 miles)
+  const remainingOverspill = overspillShipments.filter(s => !consolidatedRoutes.some(r => r.stops.includes(s)));
+  if (remainingOverspill.length >= 2 && distanceMatrix && addressData) {
+    // Sort by cluster
+    const byCluster = {};
+    remainingOverspill.forEach(s => {
+      const cluster = s.cluster || 'Others';
+      if (!byCluster[cluster]) byCluster[cluster] = [];
+      byCluster[cluster].push(s);
+    });
+    
+    // Try to combine nearby stores within same cluster
+    Object.keys(byCluster).forEach(cluster => {
+      const clusterShipments = byCluster[cluster];
+      if (clusterShipments.length >= 2) {
+        // Simple greedy grouping
+        const grouped = [];
+        const used = new Set();
+        
+        for (let i = 0; i < clusterShipments.length; i++) {
+          if (used.has(i)) continue;
+          
+          const group = [clusterShipments[i]];
+          let groupPallets = clusterShipments[i].pallets;
+          const groupTemp = clusterShipments[i].category;
+          used.add(i);
+          
+          for (let j = i + 1; j < clusterShipments.length; j++) {
+            if (used.has(j)) continue;
+            
+            const store1 = clusterShipments[i].store;
+            const store2 = clusterShipments[j].store;
+            const distance = (distanceMatrix[store1] && distanceMatrix[store1][store2]) || 999;
+            
+            // If stores are within 25 miles, same temp category, and enough pallets combined
+            const tempMatch = !groupTemp || groupTemp === clusterShipments[j].category;
+            if (distance <= 25 && tempMatch && groupPallets + clusterShipments[j].pallets >= MIN_PALLETS_OVERSPILL_CLEANUP * 0.5) {
+              group.push(clusterShipments[j]);
+              groupPallets += clusterShipments[j].pallets;
+              used.add(j);
+            }
+          }
+          
+          if (group.length >= 2 && groupPallets >= MIN_PALLETS_OVERSPILL_CLEANUP * 0.5) {
+            consolidatedRoutes.push({
+              stops: group,
+              totalPallets: groupPallets,
+              cluster: cluster,
+              reason: `Consolidated ${group.length} nearby overspill shipments in ${cluster}`
+            });
+            
+            // Remove from overspill list
+            group.forEach(s => {
+              const idx = overspillShipments.indexOf(s);
+              if (idx >= 0) overspillShipments.splice(idx, 1);
+            });
+          }
+        }
+      }
+    });
+  }
+  
+  Logger.log(`Consolidated ${consolidatedRoutes.length} overspill routes (${consolidatedRoutes.reduce((sum, r) => sum + r.totalPallets, 0).toFixed(2)} pallets)`);
+
+  // Filter out any consolidated routes that violate cluster intersection rules
+  if (context.clusterData) {
+    const before = consolidatedRoutes.length;
+    consolidatedRoutes = consolidatedRoutes.filter(r => {
+      const stores = [...new Set(r.stops.map(s => s.store))];
+      return areStoresValidTogether(stores, context.clusterData);
+    });
+    const removed = before - consolidatedRoutes.length;
+    if (removed > 0) Logger.log(`Removed ${removed} consolidated overspill routes for cluster incompatibility`);
+  }
+
+  // NEW: Attempt to pair small single-store consolidated overspill into 2–4 stop routes within same cluster
+  try {
+    const MAX_PAIR_LEG_MILES = (context.MAX_DISTANCE_BETWEEN_STOPS || 35) + 5; // allow small slack
+    const capacity53 = 26;
+    // Filter for routes that serve only ONE unique store (regardless of stop count)
+    const singleStoreCons = consolidatedRoutes.filter(r => {
+      if (!r.stops || r.stops.length === 0) return false;
+      const uniqueStores = new Set(r.stops.map(s => s.store));
+      return uniqueStores.size === 1 && r.totalPallets <= capacity53 * 0.85; // Slightly higher threshold
+    });
+    
+    const byClusterPair = {};
+    singleStoreCons.forEach(r => {
+      const store = r.stops[0].store; // Get the single store from this route
+      const clusterKey = r.cluster || 'Others';
+      if (!byClusterPair[clusterKey]) byClusterPair[clusterKey] = [];
+      byClusterPair[clusterKey].push({ store, pallets: r.totalPallets, route: r, idx: consolidatedRoutes.indexOf(r) });
+    });
+    
+    const pairedIndices = new Set(); // Track which routes were paired
+    Object.keys(byClusterPair).forEach(cluster => {
+      const list = byClusterPair[cluster];
+      const used = new Set();
+      for (let i = 0; i < list.length; i++) {
+        if (used.has(i)) continue;
+        const a = list[i];
+        const group = [a];
+        let totalPallets = a.pallets;
+        used.add(i);
+        
+        // Greedily pair with nearby stores within capacity
+        for (let j = i + 1; j < list.length; j++) {
+          if (used.has(j)) continue;
+          const b = list[j];
+          const d = (context.distanceMatrix[a.store] && context.distanceMatrix[a.store][b.store] && context.distanceMatrix[a.store][b.store].distance) || 999;
+          if (d <= MAX_PAIR_LEG_MILES && totalPallets + b.pallets <= capacity53) {
+            group.push(b);
+            totalPallets += b.pallets;
+            used.add(j);
+          }
+        }
+        
+        // If we have a pair or larger group, combine them
+        if (group.length >= 2) {
+          const combinedStops = [];
+          group.forEach(item => combinedStops.push(...item.route.stops));
+          const reason = `Paired overspill: ${group.map(g => g.store).join(' + ')} (${group.length} stores, ${totalPallets.toFixed(2)} pallets)`;
+          consolidatedRoutes.push({
+            stops: combinedStops,
+            totalPallets: totalPallets,
+            cluster: cluster,
+            reason: reason
+          });
+          // Mark originals for removal
+          group.forEach(item => pairedIndices.add(item.idx));
+        }
+      }
+    });
+    
+    // Remove original single-store consolidated routes that were paired
+    for (let i = consolidatedRoutes.length - 1; i >= 0; i--) {
+      if (pairedIndices.has(i)) {
+        consolidatedRoutes.splice(i, 1);
+      }
+    }
+    Logger.log(`Paired ${pairedIndices.size} single-store consolidations into multi-stop routes`);
+  } catch (e) {
+    Logger.log('Pairing overspill error: ' + e);
+  }
+  return consolidatedRoutes;
 }
 
 function planRemainingShipments(shipments, context, planSheet) {
   const unplannableTime = shipments.filter(s => s.failureReason === 'Time Constraint');
   const unplannableOther = shipments.filter(s => s.failureReason && s.failureReason !== 'Time Constraint');
-  const overspillShipments = shipments.filter(s => !s.failureReason);
+  let overspillShipments = shipments.filter(s => !s.failureReason);
+  
+  // NEW: Try to consolidate overspill first
+  let consolidatedRoutes = consolidateOverspillShipments(overspillShipments, context);
+  
+  // NEW: Attempt to promote valid consolidated overspill to main routes
+  const promotedRoutes = promoteValidConsolidatedOverspill(consolidatedRoutes, context);
+
+  // Assign real carriers to promoted routes
+  const carriers = getCarriers();
+  promotedRoutes.forEach((route, idx) => {
+    // Pick the cheapest available carrier/time for this route based on mileage
+    let bestCarrier = null;
+    let bestTime = null;
+    let bestCost = Infinity;
+    const metrics = calculateRouteMetricsWithHOS(route.stops, context.warehouse, context.distanceMatrix, context.detailedDurations);
+    carriers.forEach(carrier => {
+      carrier.timeSlots.forEach(slot => {
+        if (slot.used >= slot.capacity) return;
+        const cost = (metrics.totalDistance * (carrier.costPerMile || 0)) + (carrier.costPerRoute || 0);
+        if (cost < bestCost) {
+          bestCost = cost;
+          bestCarrier = carrier;
+          bestTime = slot.time;
+        }
+      });
+    });
+    const assigned = bestCarrier ? { carrier: bestCarrier, time: bestTime } : { carrier: { name: 'Promoted Consolidation', pallets53: 26, pallets48: 22, pallets36: 18, costPerMile: 0, costPerRoute: 0 }, time: '23:00' };
+    writeRouteToSheet({
+      carrier: assigned.carrier,
+      time: assigned.time,
+      stops: route.stops,
+      totalPallets: route.totalPallets,
+      cluster: route.cluster,
+      notes: 'Validated consolidated overspill promoted to main route'
+    }, planSheet, context);
+  });
+  
+  // Write remaining consolidated routes as overspill
+  consolidatedRoutes.forEach((consolidation, idx) => {
+    writeRouteToSheet({
+      carrier: { 
+        name: 'Consolidated Overspill', 
+        pallets53: 26, 
+        pallets48: 22, 
+        pallets36: 18, 
+        costPerMile: 0, 
+        costPerRoute: 0 
+      },
+      routeId: `ConsolidatedOvsp_${idx + 1}`,
+      time: '23:00',
+      stops: consolidation.stops,
+      totalPallets: consolidation.totalPallets,
+      cluster: consolidation.cluster,
+      notes: consolidation.reason
+    }, planSheet, context);
+  });
+
 
   if (unplannableTime.length > 0) {
     writeRouteToSheet({ 
@@ -1283,6 +2277,9 @@ function planRemainingShipments(shipments, context, planSheet) {
   let overspillRoutes = [];
   overspillShipments.sort((a,b) => b.pallets - a.pallets);
 
+  // Use relaxed minimum for overspill
+  const MIN_PALLETS_OVERSPILL = context.MIN_PALLETS_OVERSPILL_CLEANUP || 8;
+
   overspillShipments.forEach(shipment => {
     let added = false;
     for (const route of overspillRoutes) {
@@ -1299,22 +2296,50 @@ function planRemainingShipments(shipments, context, planSheet) {
         time: '23:00',
         stops: [shipment],
         totalPallets: shipment.pallets,
-        cluster: 'Overspill'
+        cluster: shipment.cluster || 'Overspill'
       });
     }
   });
+  
+  // Filter out routes below minimum
+  overspillRoutes = overspillRoutes.filter(r => r.totalPallets >= MIN_PALLETS_OVERSPILL);
   
   overspillRoutes.forEach((route, i) => {
     route.routeId = `Overspill_${i + 1}`;
     writeRouteToSheet(route, planSheet, context);
   });
+  
+  // Log overspill that's still too small
+  const tooSmall = overspillShipments.filter(s => {
+    const inRoute = overspillRoutes.some(r => r.stops.includes(s));
+    return !inRoute;
+  });
+  if (tooSmall.length > 0) {
+    Logger.log(`Warning: ${tooSmall.length} shipments below ${MIN_PALLETS_OVERSPILL} pallets remain unrouted`);
+  }
 }
 
 function writeRouteToSheet(route, planSheet, context) {
   if (!route.stops || route.stops.length === 0) return;
 
-  const { warehouse, distanceMatrix, detailedDurations, restrictions, addressData, MAX_ROUTE_MILEAGE } = context;
-  const optimizedStops = advancedOptimizeStopOrder(route.stops, warehouse, distanceMatrix);
+  const { warehouse, distanceMatrix, detailedDurations, restrictions, addressData, tollMatrix, MAX_ROUTE_MILEAGE } = context;
+  let optimizedStops = advancedOptimizeStopOrder(route.stops, warehouse, distanceMatrix);
+  // NEW: Apply cold-safe ordering if needed to avoid warnings when mileage impact is acceptable
+  if (!validateColdChainCompliance(optimizedStops, context)) {
+    const coldSafe = enforceColdSafeOrdering(optimizedStops);
+    const coldSafeMetrics = calculateRouteMetricsWithHOS(coldSafe, warehouse, distanceMatrix, detailedDurations);
+    const originalMetrics = calculateRouteMetricsWithHOS(optimizedStops, warehouse, distanceMatrix, detailedDurations);
+    const withinCap = coldSafeMetrics.totalDistance <= MAX_ROUTE_MILEAGE;
+    const modestIncrease = coldSafeMetrics.totalDistance <= originalMetrics.totalDistance * 1.12; // allow up to 12% mileage growth to clear cold-chain issues
+    if (withinCap && modestIncrease) {
+      optimizedStops = coldSafe;
+    }
+  }
+  
+  // Validate cold chain compliance
+  const coldChainCompliant = validateColdChainCompliance(optimizedStops, context);
+  const zoneAllocation = allocateTemperatureZones(optimizedStops);
+  
   const metrics = calculateRouteMetricsWithHOS(optimizedStops, warehouse, distanceMatrix, detailedDurations);
   const trailerSize = getRequiredTrailerSize(route, restrictions);
   
@@ -1322,6 +2347,17 @@ function writeRouteToSheet(route, planSheet, context) {
   if (metrics.totalDistance > MAX_ROUTE_MILEAGE * 0.85) {
     const stores = [...new Set(optimizedStops.map(s => s.store))].join(' -> ');
     Logger.log(`WARNING: Route ${route.routeId} has ${metrics.totalDistance} miles (${(metrics.totalDistance/MAX_ROUTE_MILEAGE*100).toFixed(1)}% of max). Stores: ${stores}`);
+  }
+  
+  // CRITICAL: Reject routes that exceed mileage cap
+  if (metrics.totalDistance > MAX_ROUTE_MILEAGE) {
+    Logger.log(`ERROR: Route ${route.routeId} REJECTED for exceeding mileage cap: ${metrics.totalDistance} > ${MAX_ROUTE_MILEAGE}`);
+    return; // Do not write this route - it violates constraints
+  }
+  
+  // Log cold chain warning if not compliant
+  if (!coldChainCompliant) {
+    Logger.log(`WARNING: Route ${route.routeId} may have cold chain issues. Review unload sequence.`);
   }
   
   let capacity = 0;
@@ -1335,22 +2371,46 @@ function writeRouteToSheet(route, planSheet, context) {
       }
   }
   const utilization = capacity > 0 && capacity < 999 ? `${(route.totalPallets / capacity * 100).toFixed(1)}%` : 'N/A';
-  const cost = (metrics.totalDistance * (route.carrier.costPerMile || 0)) + (route.carrier.costPerRoute || 0);
+  
+  // Calculate cost including tolls
+  let cost = (metrics.totalDistance * (route.carrier.costPerMile || 0)) + (route.carrier.costPerRoute || 0);
+  if (tollMatrix) {
+    const tollCost = calculateRouteTollCost(optimizedStops, warehouse, tollMatrix);
+    cost += tollCost;
+    if (tollCost > 0) {
+      Logger.log(`Route ${route.routeId} toll cost: $${tollCost.toFixed(2)}`);
+    }
+  }
+  
   const mapLink = generateMapLink(optimizedStops, warehouse, addressData);
+
+  // Enhanced notes with cold chain and zone info
+  let notes = route.notes || '';
+  if (!coldChainCompliant) notes += ' [COLD CHAIN WARNING]';
+  notes += ` [${zoneAllocation.info}]`;
 
   planSheet.appendRow([
     route.carrier.name, route.routeId, route.cluster,
     [...new Set(optimizedStops.map(s => s.store))].length, formatStopSequence(optimizedStops),
     formatDetailedRoute(optimizedStops, warehouse, distanceMatrix), metrics.totalDistance,
     checkRouteForRestrictions(optimizedStops, restrictions), `${trailerSize}'`,
-    'Dual Temp', route.totalPallets.toFixed(2), utilization,
+    zoneAllocation.frontZone.length > 0 && zoneAllocation.rearZone.length > 0 ? 'Dual Temp' : 'Single Temp',
+    route.totalPallets.toFixed(2), utilization,
     metrics.travelTime, metrics.stopTime, metrics.totalDuration,
     metrics.hosStatus,
     cost > 0 ? cost.toFixed(2) : 'N/A',
     metrics.totalDistance > MAX_ROUTE_MILEAGE ? 'OVER' : 'OK',
-    route.notes || '',
+    notes,
     mapLink
   ]);
+  
+  // NEW: Highlight any route containing Freezer in light blue
+  const isFreezerPresent = optimizedStops.some(s => s.category === 'Freezer');
+  if (isFreezerPresent) {
+    const lastRow = planSheet.getLastRow();
+    planSheet.getRange(lastRow, 1, 1, 20).setBackground('#ADD8E6'); // Light blue
+    Logger.log(`Route ${route.routeId} contains Freezer - highlighted in light blue`);
+  }
 }
 
 // --- ROUTE OPTIMIZATION & METRIC CALCULATION ---
@@ -1443,6 +2503,15 @@ function checkRouteForRestrictions(stops, restrictions) {
 function advancedOptimizeStopOrder(stops, warehouse, distanceMatrix) {
   if (stops.length <= 1) return stops;
 
+  // Use cold chain aware optimization if mixed temperatures
+  const hasCold = stops.some(s => s.category === 'Chiller' || s.category === 'Freezer');
+  const hasAmbient = stops.some(s => s.category === 'Ambient' || s.category === 'Produce');
+  
+  if (hasCold && hasAmbient) {
+    return coldChainOptimizeStopOrder(stops, warehouse, distanceMatrix);
+  }
+
+  // Standard optimization for single-temp routes
   const stopsData = {};
   stops.forEach(s => {
     if (!stopsData[s.store]) stopsData[s.store] = { shipments: [], categories: new Set() };
@@ -1707,7 +2776,7 @@ function calculateRouteScore(route, context) {
   // Penalize under-utilization more aggressively
   const utilization = route.totalPallets / capacity;
   // Much stronger penalty for under-utilization to push towards fuller trucks
-  const utilizationPenalty = Math.pow(1 - utilization, 2) * 5000; // Increased from 2000 to 5000
+  const utilizationPenalty = Math.pow(1 - utilization, 2) * 3500; // Slightly relaxed to allow smaller runs
   
   // Add penalty for high mileage routes to keep them under target
   const MAX_ROUTE_MILEAGE = context.MAX_ROUTE_MILEAGE || 425;
@@ -1733,7 +2802,19 @@ function isRouteValid(route, context) {
   const { MAX_ROUTE_MILEAGE, MAX_STOPS_GENERAL, OVERPLAN_FACTOR } = context;
   
   // Check basic constraints
-  if ([...new Set(route.stops.map(s => s.store))].length > MAX_STOPS_GENERAL) return false;
+  const uniqueStores = [...new Set(route.stops.map(s => s.store))];
+  if (uniqueStores.length > MAX_STOPS_GENERAL) return false;
+
+  // Enforce cluster intersection: all stores must share at least one allowed cluster
+  if (context.clusterData && !areStoresValidTogether(uniqueStores, context.clusterData)) return false;
+
+  // Region-aware stop cap: NYC-specific clusters limited to 2 stops; others allow up to 4
+  if (context.addressData) {
+    const nycClusters = new Set(['East NY', 'West NY', 'NY', 'UpperMidLG', 'UpperEastLG', 'LowerMidLG', 'LGMain', 'LowerEastLG']);
+    const regions = uniqueStores.map(s => getStoreRegion(s, context.addressData));
+    const allNYC = regions.length > 0 && regions.every(r => nycClusters.has(r));
+    if (allNYC && uniqueStores.length > 2) return false;
+  }
   // Build per-store counts for temperature compatibility checks
   const perStoreCounts = {};
   route.stops.forEach(s => {
@@ -1959,17 +3040,35 @@ function updateDashboard() {
   const stopSeqIdx = headers.indexOf('Stop Sequence');
   const costIdx = headers.indexOf('Estimated Cost');
   const notesIdx = headers.indexOf('Notes');
+  const detailedRouteIdx = headers.indexOf('Detailed Route');
+  const routeIdIdx = headers.indexOf('Route ID');
 
   const stats = {
-    totalRoutes: 0, totalPallets: 0, totalMileage: 0, totalDuration: 0, totalCost: 0,
-    unplannablePallets: 0, overspillPallets: 0, unusedCapacity: 0,
-    carrierData: {}, clusterData: {}, unplannableReasons: {}
+    totalRoutes: 0, 
+    totalPallets: 0, 
+    totalMileage: 0, 
+    totalDuration: 0, 
+    totalCost: 0,
+    unplannablePallets: 0, 
+    overspillPallets: 0, 
+    consolidatedPallets: 0,
+    unusedCapacity: 0,
+    carrierData: {}, 
+    clusterData: {}, 
+    unplannableReasons: {},
+    legDistances: [], // NEW - track leg distances
+    crossRegionRoutes: [], // NEW - routes with long legs
+    overspillByCategory: { AMB: 0, CHI: 0, FRE: 0, PRO: 0 }, // NEW
+    overspillByStore: {}, // NEW - track stores in overspill
+    coldChainWarnings: 0 // NEW
   };
 
   dataRows.forEach(row => {
     const carrier = row[carrierIdx];
     const pallets = parseFloat(row[palletsIdx]) || 0;
     const stopSequence = row[stopSeqIdx];
+    const notes = String(row[notesIdx] || '');
+    const routeId = row[routeIdIdx];
 
     if (stopSequence === 'UNUSED CAPACITY' || stopSequence === 'NOT PLANNED') {
       stats.unusedCapacity++;
@@ -1978,24 +3077,77 @@ function updateDashboard() {
 
     if (carrier.includes('Unplannable')) {
       stats.unplannablePallets += pallets;
-      const reason = (String(row[notesIdx]).match(/Failed due to (.*)\./) || [])[1] || 'Other';
+      const reason = (notes.match(/Failed due to (.*)\./) || [])[1] || 'Other';
       stats.unplannableReasons[reason] = (stats.unplannableReasons[reason] || 0) + 1;
       return;
     }
-    if (carrier.includes('Overspill')) stats.overspillPallets += pallets;
+    
+    if (carrier.includes('Consolidated Overspill')) {
+      stats.consolidatedPallets += pallets;
+      // Track as planned route with note
+      stats.totalRoutes++;
+      stats.totalPallets += pallets;
+      return;
+    }
+    
+    if (carrier.includes('Overspill')) {
+      stats.overspillPallets += pallets;
+      
+      // NEW: Track overspill by category
+      const stopSeqStr = String(stopSequence);
+      if (stopSeqStr.includes('AMB')) stats.overspillByCategory.AMB += pallets;
+      if (stopSeqStr.includes('CHI')) stats.overspillByCategory.CHI += pallets;
+      if (stopSeqStr.includes('FRE')) stats.overspillByCategory.FRE += pallets;
+      if (stopSeqStr.includes('PRO')) stats.overspillByCategory.PRO += pallets;
+      
+      // NEW: Track stores appearing in overspill
+      const stores = stopSeqStr.match(/\d{4}/g) || [];
+      stores.forEach(store => {
+        stats.overspillByStore[store] = (stats.overspillByStore[store] || 0) + 1;
+      });
+      return;
+    }
 
     stats.totalRoutes++;
     stats.totalPallets += pallets;
     stats.totalMileage += parseFloat(row[mileageIdx]) || 0;
     stats.totalDuration += parseFloat(row[durationIdx]) || 0;
     stats.totalCost += parseFloat(row[costIdx]) || 0;
+    
+    // NEW: Track cold chain warnings
+    if (notes.includes('COLD CHAIN WARNING')) {
+      stats.coldChainWarnings++;
+    }
+    
+    // NEW: Parse leg distances from detailed route
+    const detailedRoute = String(row[detailedRouteIdx] || '');
+    const legMatches = detailedRoute.match(/\((\d+(?:\.\d+)?)\s*mi\)/g);
+    if (legMatches) {
+      legMatches.forEach(match => {
+        const distance = parseFloat(match.match(/\d+(?:\.\d+)?/)[0]);
+        stats.legDistances.push({ routeId, distance });
+        
+        // NEW: Flag cross-region routes (legs >75 miles)
+        if (distance > 75) {
+          stats.crossRegionRoutes.push({ routeId, legDistance: distance });
+        }
+      });
+    }
 
     if (!stats.carrierData[carrier]) {
-      stats.carrierData[carrier] = { routes: 0, pallets: 0, totalUtilization: 0, utilizationCount: 0, cost: 0 };
+      stats.carrierData[carrier] = { 
+        routes: 0, 
+        pallets: 0, 
+        totalUtilization: 0, 
+        utilizationCount: 0, 
+        cost: 0,
+        mileage: 0 
+      };
     }
     stats.carrierData[carrier].routes++;
     stats.carrierData[carrier].pallets += pallets;
     stats.carrierData[carrier].cost += parseFloat(row[costIdx]) || 0;
+    stats.carrierData[carrier].mileage += parseFloat(row[mileageIdx]) || 0;
     const utilStr = String(row[utilizationIdx]);
     if (utilStr && utilStr !== 'N/A') {
       stats.carrierData[carrier].totalUtilization += parseFloat(utilStr.replace('%', ''));
@@ -2004,72 +3156,359 @@ function updateDashboard() {
 
     const cluster = row[clusterIdx];
     if (cluster && cluster !== 'N/A') {
-      if (!stats.clusterData[cluster]) stats.clusterData[cluster] = { routes: 0 };
+      if (!stats.clusterData[cluster]) stats.clusterData[cluster] = { routes: 0, pallets: 0 };
       stats.clusterData[cluster].routes++;
+      stats.clusterData[cluster].pallets += pallets;
     }
   });
 
-  // --- Write KPIs ---
-  dashboardSheet.getRange('A1:B1').merge().setValue('Overall Plan Summary').setFontWeight('bold').setHorizontalAlignment('center').setBackground('#e0e0e0');
-  const kpis = [
+  let currentRow = 1;
+
+  // --- Section 1: OVERALL SUMMARY ---
+  dashboardSheet.getRange(currentRow, 1, 1, 6).merge()
+    .setValue('📊 OVERALL PLAN SUMMARY')
+    .setFontWeight('bold')
+    .setFontSize(14)
+    .setHorizontalAlignment('center')
+    .setBackground('#4285f4')
+    .setFontColor('#ffffff');
+  currentRow += 2;
+
+  const overallKpis = [
     ['Total Planned Routes', stats.totalRoutes],
     ['Total Planned Pallets', stats.totalPallets.toFixed(2)],
-    ['Total Mileage', stats.totalMileage.toFixed(0)],
-    ['Total Estimated Cost', `$${stats.totalCost.toFixed(2)}`],
-    ['Avg. Cost Per Mile', `$${(stats.totalCost / stats.totalMileage || 0).toFixed(2)}`],
+    ['Consolidated Overspill Pallets', stats.consolidatedPallets.toFixed(2)],
+    ['Remaining Overspill Pallets', stats.overspillPallets.toFixed(2)],
     ['Unplannable Pallets', stats.unplannablePallets.toFixed(2)],
-    ['Overspill Pallets', stats.overspillPallets.toFixed(2)],
-    ['Unused Carrier Slots', stats.unusedCapacity]
+    ['Total Mileage', stats.totalMileage.toFixed(0) + ' miles'],
+    ['Total Estimated Cost', `$${stats.totalCost.toFixed(2)}`],
+    ['Avg Cost Per Mile', `$${(stats.totalCost / stats.totalMileage || 0).toFixed(2)}`],
+    ['Unused Carrier Slots', stats.unusedCapacity],
+    ['Cold Chain Warnings', stats.coldChainWarnings]
   ];
-  dashboardSheet.getRange('A2:B9').setValues(kpis);
-  dashboardSheet.getRange('A1:B9').setBorder(true, true, true, true, true, true);
-
-  // --- Prepare Chart Data ---
-  const carrierChartData = [['Carrier', 'Routes', 'Total Pallets', 'Total Cost']];
-  for (const name in stats.carrierData) {
-    carrierChartData.push([name, stats.carrierData[name].routes, stats.carrierData[name].pallets, stats.carrierData[name].cost]);
+  dashboardSheet.getRange(currentRow, 1, overallKpis.length, 2).setValues(overallKpis);
+  dashboardSheet.getRange(currentRow, 1, overallKpis.length, 2)
+    .setBorder(true, true, true, true, true, true);
+  dashboardSheet.getRange(currentRow, 1, overallKpis.length, 1).setFontWeight('bold');
+  
+  // Color code critical metrics
+  if (stats.overspillPallets > 50) {
+    dashboardSheet.getRange(currentRow + 3, 2).setBackground('#ffcccc'); // Red for high overspill
+  } else if (stats.overspillPallets > 20) {
+    dashboardSheet.getRange(currentRow + 3, 2).setBackground('#fff4cc'); // Yellow
+  } else {
+    dashboardSheet.getRange(currentRow + 3, 2).setBackground('#ccffcc'); // Green
   }
-  const carrierDataRange = dashboardSheet.getRange(11, 1, carrierChartData.length, carrierChartData[0].length);
-  carrierDataRange.setValues(carrierChartData).setBorder(true, true, true, true, true, true);
-  dashboardSheet.getRange(11, 1, 1, carrierChartData[0].length).setFontWeight('bold').setBackground('#e0e0e0');
-
-  const clusterChartData = [['Cluster', 'Number of Routes']];
-  for (const name in stats.clusterData) {
-    clusterChartData.push([name, stats.clusterData[name].routes]);
+  
+  if (stats.coldChainWarnings > 0) {
+    dashboardSheet.getRange(currentRow + 9, 2).setBackground('#fff4cc'); // Yellow warning
   }
-  const clusterDataRange = dashboardSheet.getRange(11, 6, clusterChartData.length, clusterChartData[0].length);
-  clusterDataRange.setValues(clusterChartData).setBorder(true, true, true, true, true, true);
-  dashboardSheet.getRange(11, 6, 1, clusterChartData[0].length).setFontWeight('bold').setBackground('#e0e0e0');
+  
+  currentRow += overallKpis.length + 2;
 
-  const unplannableChartData = [['Reason', 'Count']];
-  for (const reason in stats.unplannableReasons) {
-    unplannableChartData.push([reason, stats.unplannableReasons[reason]]);
+  // --- Section 2: CROSS-REGION ANALYSIS ---
+  if (stats.crossRegionRoutes.length > 0) {
+    dashboardSheet.getRange(currentRow, 1, 1, 3).merge()
+      .setValue('⚠️ CROSS-REGION ROUTING ISSUES')
+      .setFontWeight('bold')
+      .setFontSize(12)
+      .setHorizontalAlignment('center')
+      .setBackground('#ff9800')
+      .setFontColor('#ffffff');
+    currentRow += 2;
+    
+    const crossRegionData = [['Route ID', 'Leg Distance (miles)', 'Issue Severity']];
+    stats.crossRegionRoutes.forEach(r => {
+      const severity = r.legDistance > 100 ? 'CRITICAL' : r.legDistance > 85 ? 'HIGH' : 'MEDIUM';
+      crossRegionData.push([r.routeId, r.legDistance.toFixed(1), severity]);
+    });
+    
+    dashboardSheet.getRange(currentRow, 1, crossRegionData.length, 3).setValues(crossRegionData);
+    dashboardSheet.getRange(currentRow, 1, 1, 3).setFontWeight('bold').setBackground('#ffe0cc');
+    dashboardSheet.getRange(currentRow, 1, crossRegionData.length, 3)
+      .setBorder(true, true, true, true, true, true);
+    
+    currentRow += crossRegionData.length + 2;
   }
-  const unplannableDataRange = dashboardSheet.getRange(11, 9, unplannableChartData.length, unplannableChartData[0].length);
-  unplannableDataRange.setValues(unplannableChartData).setBorder(true, true, true, true, true, true);
-  dashboardSheet.getRange(11, 9, 1, unplannableChartData[0].length).setFontWeight('bold').setBackground('#e0e0e0');
 
+  // --- Section 3: OVERSPILL ANALYSIS ---
+  dashboardSheet.getRange(currentRow, 1, 1, 4).merge()
+    .setValue('📦 OVERSPILL BREAKDOWN')
+    .setFontWeight('bold')
+    .setFontSize(12)
+    .setHorizontalAlignment('center')
+    .setBackground('#9c27b0')
+    .setFontColor('#ffffff');
+  currentRow += 2;
+
+  const overspillBreakdown = [
+    ['Category', 'Pallets', '% of Total'],
+    ['Ambient (AMB)', stats.overspillByCategory.AMB.toFixed(2), 
+     ((stats.overspillByCategory.AMB / stats.overspillPallets * 100) || 0).toFixed(1) + '%'],
+    ['Chiller (CHI)', stats.overspillByCategory.CHI.toFixed(2), 
+     ((stats.overspillByCategory.CHI / stats.overspillPallets * 100) || 0).toFixed(1) + '%'],
+    ['Freezer (FRE)', stats.overspillByCategory.FRE.toFixed(2), 
+     ((stats.overspillByCategory.FRE / stats.overspillPallets * 100) || 0).toFixed(1) + '%'],
+    ['Produce (PRO)', stats.overspillByCategory.PRO.toFixed(2), 
+     ((stats.overspillByCategory.PRO / stats.overspillPallets * 100) || 0).toFixed(1) + '%']
+  ];
+  dashboardSheet.getRange(currentRow, 1, overspillBreakdown.length, 3).setValues(overspillBreakdown);
+  dashboardSheet.getRange(currentRow, 1, 1, 3).setFontWeight('bold').setBackground('#e0e0e0');
+  dashboardSheet.getRange(currentRow, 1, overspillBreakdown.length, 3)
+    .setBorder(true, true, true, true, true, true);
+  currentRow += overspillBreakdown.length + 1;
+
+  // Stores appearing multiple times in overspill
+  const repeatedStores = Object.keys(stats.overspillByStore).filter(s => stats.overspillByStore[s] > 1);
+  if (repeatedStores.length > 0) {
+    dashboardSheet.getRange(currentRow, 1).setValue('⚠️ Stores in Multiple Overspill Routes:').setFontWeight('bold');
+    currentRow++;
+    
+    const storeData = [['Store', 'Occurrences', 'Consolidation Opportunity']];
+    repeatedStores.forEach(store => {
+      storeData.push([store, stats.overspillByStore[store], 'YES - Combine into multi-temp route']);
+    });
+    
+    dashboardSheet.getRange(currentRow, 1, storeData.length, 3).setValues(storeData);
+    dashboardSheet.getRange(currentRow, 1, 1, 3).setFontWeight('bold').setBackground('#fff4cc');
+    dashboardSheet.getRange(currentRow, 1, storeData.length, 3)
+      .setBorder(true, true, true, true, true, true);
+    currentRow += storeData.length + 2;
+  }
+
+  // --- Section 4: ROUTE QUALITY METRICS ---
+  dashboardSheet.getRange(currentRow, 1, 1, 4).merge()
+    .setValue('📏 ROUTE QUALITY METRICS')
+    .setFontWeight('bold')
+    .setFontSize(12)
+    .setHorizontalAlignment('center')
+    .setBackground('#2196f3')
+    .setFontColor('#ffffff');
+  currentRow += 2;
+
+  const avgLegDistance = stats.legDistances.length > 0 ? 
+    stats.legDistances.reduce((sum, l) => sum + l.distance, 0) / stats.legDistances.length : 0;
+  const maxLegDistance = stats.legDistances.length > 0 ? 
+    Math.max(...stats.legDistances.map(l => l.distance)) : 0;
+  const legsOver50 = stats.legDistances.filter(l => l.distance > 50).length;
+  const legsOver75 = stats.legDistances.filter(l => l.distance > 75).length;
+  const legsOver100 = stats.legDistances.filter(l => l.distance > 100).length;
+
+  const qualityMetrics = [
+    ['Metric', 'Value', 'Status'],
+    ['Average Leg Distance', avgLegDistance.toFixed(1) + ' miles', avgLegDistance < 40 ? '✓ Good' : '⚠ Review'],
+    ['Maximum Leg Distance', maxLegDistance.toFixed(1) + ' miles', maxLegDistance < 75 ? '✓ OK' : '✗ Problem'],
+    ['Legs > 50 miles', legsOver50, legsOver50 === 0 ? '✓ Excellent' : '⚠ Review'],
+    ['Legs > 75 miles', legsOver75, legsOver75 === 0 ? '✓ Good' : '✗ Fix Required'],
+    ['Legs > 100 miles', legsOver100, legsOver100 === 0 ? '✓ Good' : '✗ CRITICAL'],
+    ['Cross-Region Routes', stats.crossRegionRoutes.length, stats.crossRegionRoutes.length === 0 ? '✓ None' : '✗ ' + stats.crossRegionRoutes.length + ' routes']
+  ];
+  
+  dashboardSheet.getRange(currentRow, 1, qualityMetrics.length, 3).setValues(qualityMetrics);
+  dashboardSheet.getRange(currentRow, 1, 1, 3).setFontWeight('bold').setBackground('#e0e0e0');
+  dashboardSheet.getRange(currentRow, 1, qualityMetrics.length, 3)
+    .setBorder(true, true, true, true, true, true);
+  
+  // Color code status column
+  for (let i = 1; i < qualityMetrics.length; i++) {
+    const statusCell = dashboardSheet.getRange(currentRow + i, 3);
+    if (qualityMetrics[i][2].includes('✓')) {
+      statusCell.setBackground('#ccffcc'); // Green
+    } else if (qualityMetrics[i][2].includes('⚠')) {
+      statusCell.setBackground('#fff4cc'); // Yellow
+    } else if (qualityMetrics[i][2].includes('✗')) {
+      statusCell.setBackground('#ffcccc'); // Red
+    }
+  }
+  
+  currentRow += qualityMetrics.length + 2;
+
+  // --- Section 5: CARRIER PERFORMANCE ---
+  dashboardSheet.getRange(currentRow, 1, 1, 6).merge()
+    .setValue('🚛 CARRIER PERFORMANCE & UTILIZATION')
+    .setFontWeight('bold')
+    .setFontSize(12)
+    .setHorizontalAlignment('center')
+    .setBackground('#4caf50')
+    .setFontColor('#ffffff');
+  currentRow += 2;
+
+  const carrierTableData = [['Carrier', 'Routes', 'Pallets', 'Avg Util.', 'Cost', 'Cost/Pallet', 'Miles/Route']];
+  for (const carrierName in stats.carrierData) {
+    const c = stats.carrierData[carrierName];
+    const avgUtil = c.utilizationCount > 0 ? (c.totalUtilization / c.utilizationCount).toFixed(1) + '%' : 'N/A';
+    const costPerPallet = (c.cost / c.pallets || 0).toFixed(2);
+    const milesPerRoute = (c.mileage / c.routes || 0).toFixed(0);
+    carrierTableData.push([
+      carrierName, 
+      c.routes, 
+      c.pallets.toFixed(2), 
+      avgUtil,
+      `$${c.cost.toFixed(2)}`,
+      `$${costPerPallet}`,
+      milesPerRoute
+    ]);
+  }
+  
+  dashboardSheet.getRange(currentRow, 1, carrierTableData.length, 7).setValues(carrierTableData);
+  dashboardSheet.getRange(currentRow, 1, 1, 7).setFontWeight('bold').setBackground('#e0e0e0');
+  dashboardSheet.getRange(currentRow, 1, carrierTableData.length, 7)
+    .setBorder(true, true, true, true, true, true);
+  
+  const carrierChartStartRow = currentRow;
+  currentRow += carrierTableData.length + 2;
+
+  // --- Section 6: CLUSTER DISTRIBUTION ---
+  if (Object.keys(stats.clusterData).length > 0) {
+    dashboardSheet.getRange(currentRow, 1, 1, 3).merge()
+      .setValue('🗺️ GEOGRAPHIC CLUSTER DISTRIBUTION')
+      .setFontWeight('bold')
+      .setFontSize(12)
+      .setHorizontalAlignment('center')
+      .setBackground('#ff5722')
+      .setFontColor('#ffffff');
+    currentRow += 2;
+
+    const clusterTableData = [['Cluster', 'Routes', 'Pallets']];
+    for (const clusterName in stats.clusterData) {
+      const c = stats.clusterData[clusterName];
+      clusterTableData.push([clusterName, c.routes, c.pallets.toFixed(2)]);
+    }
+    
+    dashboardSheet.getRange(currentRow, 1, clusterTableData.length, 3).setValues(clusterTableData);
+    dashboardSheet.getRange(currentRow, 1, 1, 3).setFontWeight('bold').setBackground('#e0e0e0');
+    dashboardSheet.getRange(currentRow, 1, clusterTableData.length, 3)
+      .setBorder(true, true, true, true, true, true);
+    
+    const clusterChartStartRow = currentRow;
+    currentRow += clusterTableData.length + 2;
+  }
+
+  // --- Section 7: UNPLANNABLE SHIPMENTS ---
+  if (Object.keys(stats.unplannableReasons).length > 0) {
+    dashboardSheet.getRange(currentRow, 1, 1, 3).merge()
+      .setValue('❌ UNPLANNABLE SHIPMENTS ANALYSIS')
+      .setFontWeight('bold')
+      .setFontSize(12)
+      .setHorizontalAlignment('center')
+      .setBackground('#f44336')
+      .setFontColor('#ffffff');
+    currentRow += 2;
+
+    const unplannableTableData = [['Reason', 'Count', 'Action Needed']];
+    for (const reason in stats.unplannableReasons) {
+      let action = 'Review constraints';
+      if (reason.includes('distance')) action = 'Check address locations';
+      if (reason.includes('capacity')) action = 'Add more carrier capacity';
+      if (reason.includes('cluster')) action = 'Relax cluster constraints';
+      unplannableTableData.push([reason, stats.unplannableReasons[reason], action]);
+    }
+    
+    dashboardSheet.getRange(currentRow, 1, unplannableTableData.length, 3).setValues(unplannableTableData);
+    dashboardSheet.getRange(currentRow, 1, 1, 3).setFontWeight('bold').setBackground('#e0e0e0');
+    dashboardSheet.getRange(currentRow, 1, unplannableTableData.length, 3)
+      .setBorder(true, true, true, true, true, true);
+    
+    const unplannableChartStartRow = currentRow;
+    currentRow += unplannableTableData.length + 2;
+  }
+
+  // --- Section 8: ACTION ITEMS ---
+  dashboardSheet.getRange(currentRow, 1, 1, 4).merge()
+    .setValue('✅ RECOMMENDED ACTIONS')
+    .setFontWeight('bold')
+    .setFontSize(12)
+    .setHorizontalAlignment('center')
+    .setBackground('#607d8b')
+    .setFontColor('#ffffff');
+  currentRow += 2;
+
+  const actions = [];
+  
+  if (stats.crossRegionRoutes.length > 0) {
+    actions.push(['Priority 1', 'FIX CROSS-REGION ROUTING', 
+                  `${stats.crossRegionRoutes.length} routes have legs >75 miles. Review cluster assignments.`,
+                  'CRITICAL']);
+  }
+  
+  if (stats.overspillPallets > 50) {
+    actions.push(['Priority 2', 'REDUCE OVERSPILL', 
+                  `${stats.overspillPallets.toFixed(0)} pallets in overspill. Consolidate same-store shipments.`,
+                  'HIGH']);
+  } else if (stats.overspillPallets > 20) {
+    actions.push(['Priority 3', 'OPTIMIZE OVERSPILL', 
+                  `${stats.overspillPallets.toFixed(0)} pallets in overspill. Consider using unused carrier capacity.`,
+                  'MEDIUM']);
+  }
+  
+  if (stats.unusedCapacity > 10) {
+    actions.push(['Priority 3', 'USE UNUSED CAPACITY', 
+                  `${stats.unusedCapacity} unused carrier slots. Assign overspill to NFI/CRE.`,
+                  'MEDIUM']);
+  }
+  
+  if (stats.coldChainWarnings > 0) {
+    actions.push(['Priority 4', 'REVIEW COLD CHAIN', 
+                  `${stats.coldChainWarnings} routes have cold chain warnings. Check stop sequences.`,
+                  'LOW']);
+  }
+  
+  if (repeatedStores.length > 0) {
+    actions.push(['Priority 2', 'CONSOLIDATE STORES', 
+                  `${repeatedStores.length} stores appear in multiple overspill routes. Combine into multi-temp.`,
+                  'HIGH']);
+  }
+  
+  if (actions.length === 0) {
+    actions.push(['None', 'PLAN LOOKS GOOD', 'No critical issues detected.', 'HEALTHY']);
+  }
+  
+  if (actions.length > 0) {
+    const actionHeaders = [['Priority', 'Action', 'Details', 'Severity']];
+    dashboardSheet.getRange(currentRow, 1, 1, 4).setValues(actionHeaders);
+    dashboardSheet.getRange(currentRow, 1, 1, 4).setFontWeight('bold').setBackground('#e0e0e0');
+    currentRow++;
+    
+    dashboardSheet.getRange(currentRow, 1, actions.length, 4).setValues(actions);
+    dashboardSheet.getRange(currentRow - 1, 1, actions.length + 1, 4)
+      .setBorder(true, true, true, true, true, true);
+    
+    // Color code by severity
+    for (let i = 0; i < actions.length; i++) {
+      const severityCell = dashboardSheet.getRange(currentRow + i, 4);
+      if (actions[i][3] === 'CRITICAL') severityCell.setBackground('#ffcccc');
+      else if (actions[i][3] === 'HIGH') severityCell.setBackground('#fff4cc');
+      else if (actions[i][3] === 'MEDIUM') severityCell.setBackground('#e0f0ff');
+      else if (actions[i][3] === 'HEALTHY') severityCell.setBackground('#ccffcc');
+    }
+    
+    currentRow += actions.length + 2;
+  }
 
   // --- Create Charts ---
-  if (carrierChartData.length > 1) {
-    dashboardSheet.insertChart(dashboardSheet.newChart().setChartType(Charts.ChartType.COLUMN)
-      .addRange(dashboardSheet.getRange(11, 1, carrierChartData.length, 2)).setPosition(2, 4, 0, 0)
-      .setOption('title', 'Routes per Carrier').build());
-    dashboardSheet.insertChart(dashboardSheet.newChart().setChartType(Charts.ChartType.BAR)
-      .addRange(dashboardSheet.getRange(11, 1, carrierChartData.length, 1))
-      .addRange(dashboardSheet.getRange(11, 4, carrierChartData.length, 1))
-      .setPosition(2, 11, 0, 0).setOption('title', 'Total Cost per Carrier').build());
-  }
-  if (clusterChartData.length > 1) {
-    dashboardSheet.insertChart(dashboardSheet.newChart().setChartType(Charts.ChartType.PIE)
-      .addRange(clusterDataRange).setPosition(20, 4, 0, 0)
-      .setOption('title', 'Route Distribution by Cluster').build());
-  }
-  if (unplannableChartData.length > 1) {
-    dashboardSheet.insertChart(dashboardSheet.newChart().setChartType(Charts.ChartType.PIE)
-      .addRange(unplannableDataRange).setPosition(20, 11, 0, 0)
-      .setOption('title', 'Reasons for Unplannable Shipments').build());
+  if (carrierTableData.length > 1) {
+    const routesChart = dashboardSheet.newChart()
+      .setChartType(Charts.ChartType.COLUMN)
+      .addRange(dashboardSheet.getRange(carrierChartStartRow, 1, carrierTableData.length, 2))
+      .setPosition(5, 9, 0, 0)
+      .setOption('title', 'Routes per Carrier')
+      .setOption('hAxis', {title: 'Carrier'})
+      .setOption('vAxis', {title: 'Routes'})
+      .build();
+    dashboardSheet.insertChart(routesChart);
+    
+    const costChart = dashboardSheet.newChart()
+      .setChartType(Charts.ChartType.BAR)
+      .addRange(dashboardSheet.getRange(carrierChartStartRow, 1, carrierTableData.length, 1))
+      .addRange(dashboardSheet.getRange(carrierChartStartRow, 5, carrierTableData.length, 1))
+      .setPosition(5, 16, 0, 0)
+      .setOption('title', 'Total Cost per Carrier')
+      .setOption('hAxis', {title: 'Cost ($)'})
+      .build();
+    dashboardSheet.insertChart(costChart);
   }
 
-  dashboardSheet.autoResizeColumns(1, 11);
+  dashboardSheet.autoResizeColumns(1, 7);
+  
+  Logger.log('Dashboard updated with comprehensive metrics');
 }

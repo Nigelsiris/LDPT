@@ -29,6 +29,12 @@
       background-color: #cccccc;
       cursor: not-allowed;
     }
+    .button.danger {
+      background-color: #f44336;
+    }
+    .button.secondary {
+      background-color: #2196F3;
+    }
     select {
       width: 100%;
       padding: 8px;
@@ -42,10 +48,15 @@
       background-color: #f5f5f5;
       border: 1px solid #ddd;
       border-radius: 4px;
+      cursor: pointer;
     }
     .route-item.selected {
       background-color: #e0f7fa;
       border-color: #00acc1;
+    }
+    .route-item.warning {
+      background-color: #fff3e0;
+      border-color: #ff9800;
     }
     #routeList {
       max-height: 300px;
@@ -60,52 +71,163 @@
       font-size: 12px;
       margin-top: 4px;
     }
+    .info {
+      color: #1976d2;
+      font-size: 12px;
+      margin-top: 4px;
+      padding: 4px;
+      background-color: #e3f2fd;
+      border-radius: 3px;
+    }
+    .tabs {
+      display: flex;
+      margin-bottom: 10px;
+      border-bottom: 2px solid #ddd;
+    }
+    .tab {
+      flex: 1;
+      padding: 10px;
+      text-align: center;
+      cursor: pointer;
+      background-color: #f0f0f0;
+      border: none;
+      border-bottom: 3px solid transparent;
+      font-weight: 500;
+    }
+    .tab.active {
+      background-color: #fff;
+      border-bottom-color: #4CAF50;
+    }
+    .tab-content {
+      display: none;
+    }
+    .tab-content.active {
+      display: block;
+    }
+    .route-detail {
+      background-color: #fafafa;
+      padding: 10px;
+      border-radius: 4px;
+      margin: 10px 0;
+      font-size: 12px;
+    }
+    .detail-row {
+      display: flex;
+      justify-content: space-between;
+      margin: 4px 0;
+    }
+    .badge {
+      display: inline-block;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-size: 11px;
+      font-weight: bold;
+      margin-left: 4px;
+    }
+    .badge.cold-chain-ok {
+      background-color: #4CAF50;
+      color: white;
+    }
+    .badge.cold-chain-warn {
+      background-color: #ff9800;
+      color: white;
+    }
   </style>
 </head>
 <body>
   <div class="container">
-    <div class="section">
-      <h3>Generate New Plan</h3>
-      <button class="button" onclick="generatePlan()">Generate Full Plan</button>
-      <div id="generateStatus"></div>
+    <div class="tabs">
+      <button class="tab active" onclick="switchTab('planning')">Planning</button>
+      <button class="tab" onclick="switchTab('review')">Review Routes</button>
+      <button class="tab" onclick="switchTab('diagnostics')">Diagnostics</button>
     </div>
 
-    <div class="section">
-      <h3>Route Management</h3>
-      <div class="filter-section">
-        <label for="routeFilter">Filter Routes:</label>
-        <select id="routeFilter" onchange="updateRouteList()">
-          <option value="all">All Routes</option>
-          <option value="low-utilization">Low Utilization (&lt;85%)</option>
-          <option value="high-mileage">High Mileage (&gt;350mi)</option>
-          <option value="mixed-clusters">Mixed Clusters</option>
-        </select>
+    <!-- PLANNING TAB -->
+    <div id="planning" class="tab-content active">
+      <div class="section">
+        <h3>Generate New Plan</h3>
+        <button class="button" onclick="generatePlan()">Generate Full Plan</button>
+        <div id="generateStatus"></div>
       </div>
-      
-      <div id="routeList">
-        <!-- Routes will be dynamically populated here -->
+    </div>
+
+    <!-- REVIEW TAB -->
+    <div id="review" class="tab-content">
+      <div class="section">
+        <h3>Route Management & Review</h3>
+        <div class="filter-section">
+          <label for="routeFilter">Filter Routes:</label>
+          <select id="routeFilter" onchange="updateRouteList()">
+            <option value="all">All Routes</option>
+            <option value="low-utilization">Low Utilization (&lt;85%)</option>
+            <option value="high-mileage">High Mileage (&gt;350mi)</option>
+            <option value="mixed-clusters">Mixed Clusters</option>
+            <option value="cold-chain-warn">Cold Chain Issues</option>
+          </select>
+        </div>
+        
+        <div id="routeList">
+          <!-- Routes will be dynamically populated here -->
+        </div>
+        
+        <div style="margin-top: 10px;">
+          <button class="button" onclick="replanSelectedRoutes()" id="replanButton" disabled>
+            Replan Selected Routes
+          </button>
+          <button class="button secondary" onclick="approveSelectedRoutes()" id="approveButton" disabled>
+            Approve Selected
+          </button>
+        </div>
+        <div id="replanStatus"></div>
       </div>
-      
-      <button class="button" onclick="replanSelectedRoutes()" id="replanButton" disabled>
-        Replan Selected Routes
-      </button>
-      <div id="replanStatus"></div>
+    </div>
+
+    <!-- DIAGNOSTICS TAB -->
+    <div id="diagnostics" class="tab-content">
+      <div class="section">
+        <h3>Plan Diagnostics</h3>
+        <button class="button" onclick="generateDiagnostics()">Run Diagnostics</button>
+        <div id="diagnosticsOutput"></div>
+      </div>
     </div>
   </div>
 
   <script>
     let selectedRoutes = new Set();
     
+    function switchTab(tabName) {
+      // Hide all tab contents
+      const contents = document.getElementsByClassName('tab-content');
+      for (let i = 0; i < contents.length; i++) {
+        contents[i].classList.remove('active');
+      }
+      
+      // Remove active class from all tabs
+      const tabs = document.getElementsByClassName('tab');
+      for (let i = 0; i < tabs.length; i++) {
+        tabs[i].classList.remove('active');
+      }
+      
+      // Show selected tab content and mark tab as active
+      document.getElementById(tabName).classList.add('active');
+      event.target.classList.add('active');
+      
+      // Load routes when review tab is opened
+      if (tabName === 'review') {
+        loadRoutes();
+      }
+    }
+    
     function generatePlan() {
       const statusDiv = document.getElementById('generateStatus');
       statusDiv.innerHTML = 'Generating plan...';
       google.script.run
         .withSuccessHandler(() => {
-          statusDiv.innerHTML = 'Plan generated successfully!';
+          statusDiv.innerHTML = '<div class="info">✓ Plan generated successfully!</div>';
           loadRoutes(); // Refresh route list after generating new plan
         })
         .withFailureHandler((error) => {
-          statusDiv.innerHTML = 'Error: ' + error;
+          statusDiv.innerHTML = '<div class="warning">✗ Error: ' + error + '</div>';
         })
         .generatePlan();
     }
@@ -116,7 +238,7 @@
       google.script.run
         .withSuccessHandler(displayRoutes)
         .withFailureHandler((error) => {
-          statusDiv.innerHTML = 'Error loading routes: ' + error;
+          statusDiv.innerHTML = '<div class="warning">Error loading routes: ' + error + '</div>';
         })
         .getRoutesForReplanning();
     }
@@ -133,13 +255,23 @@
       routes.forEach(route => {
         const div = document.createElement('div');
         div.className = 'route-item';
+        
+        // Add warning class if high mileage or mixed clusters
+        if (route.totalMiles > 350 || route.hasMixedClusters) {
+          div.classList.add('warning');
+        }
+        
         div.setAttribute('data-route-id', route.routeId);
         div.onclick = () => toggleRouteSelection(route.routeId, div);
         
+        const mixedClusterBadge = route.hasMixedClusters ? ' ⚠️' : '';
+        const highMileageBadge = route.totalMiles > 350 ? ' 🛣️' : '';
+        
         div.innerHTML = `
-          <strong>${route.carrier}</strong> - ${route.routeId}<br>
-          Stops: ${route.numStops} | Utilization: ${route.utilization}%<br>
-          Total Miles: ${route.totalMiles} | Cost: $${route.cost}
+          <strong>${route.carrier}</strong> - ${route.routeId} ${mixedClusterBadge}${highMileageBadge}<br>
+          Stops: ${route.numStops} | Utilization: ${route.utilization.toFixed(1)}%<br>
+          Mileage: ${route.totalMiles.toFixed(0)} miles | Cost: $${route.cost.toFixed(2)}<br>
+          <small>Cluster${route.hasMixedClusters ? 'S (MIXED)' : '}: ' + Array.from(route.clusters).join(', ')}</small>
         `;
         
         if (selectedRoutes.has(route.routeId)) {
@@ -166,7 +298,9 @@
 
     function updateReplanButton() {
       const button = document.getElementById('replanButton');
+      const approveButton = document.getElementById('approveButton');
       button.disabled = selectedRoutes.size === 0;
+      approveButton.disabled = selectedRoutes.size === 0;
     }
 
     function replanSelectedRoutes() {
@@ -175,14 +309,24 @@
       
       google.script.run
         .withSuccessHandler(() => {
-          statusDiv.innerHTML = 'Routes replanned successfully!';
+          statusDiv.innerHTML = '<div class="info">✓ Routes replanned successfully!</div>';
           selectedRoutes.clear();
-          loadRoutes(); // Refresh the route list
+          setTimeout(loadRoutes, 1000); // Refresh after 1 second
         })
         .withFailureHandler((error) => {
-          statusDiv.innerHTML = 'Error: ' + error;
+          statusDiv.innerHTML = '<div class="warning">✗ Error: ' + error + '</div>';
         })
         .replanRoutes(Array.from(selectedRoutes));
+    }
+
+    function approveSelectedRoutes() {
+      const statusDiv = document.getElementById('replanStatus');
+      const count = selectedRoutes.size;
+      statusDiv.innerHTML = `<div class="info">✓ Approved ${count} route(s)</div>`;
+      selectedRoutes.clear();
+      setTimeout(() => {
+        statusDiv.innerHTML = '';
+      }, 2000);
     }
 
     function updateRouteList() {
@@ -190,13 +334,45 @@
       google.script.run
         .withSuccessHandler(displayRoutes)
         .withFailureHandler((error) => {
-          document.getElementById('replanStatus').innerHTML = 'Error: ' + error;
+          document.getElementById('replanStatus').innerHTML = '<div class="warning">Error: ' + error + '</div>';
         })
         .getRoutesForReplanning(filter);
     }
 
+    function generateDiagnostics() {
+      const outputDiv = document.getElementById('diagnosticsOutput');
+      outputDiv.innerHTML = '<div class="info">Generating diagnostics...</div>';
+      google.script.run
+        .withSuccessHandler((diagnostics) => {
+          if (!diagnostics) {
+            outputDiv.innerHTML = '<div class="warning">No plan data available</div>';
+            return;
+          }
+          
+          let html = '<div class="route-detail">';
+          html += '<strong>Plan Summary:</strong><br>';
+          html += `<div class="detail-row"><span>Total Routes:</span> <strong>${diagnostics.totalRoutes}</strong></div>`;
+          html += `<div class="detail-row"><span>Total Pallets:</span> <strong>${diagnostics.totalPallets.toFixed(0)}</strong></div>`;
+          html += `<div class="detail-row"><span>Total Mileage:</span> <strong>${diagnostics.totalMileage.toFixed(0)} mi</strong></div>`;
+          html += `<div class="detail-row"><span>Avg Mileage/Route:</span> <strong>${diagnostics.avgMileage.toFixed(0)} mi</strong></div>`;
+          html += `<div class="detail-row"><span>Avg Utilization:</span> <strong>${(diagnostics.avgUtil * 100).toFixed(1)}%</strong></div>`;
+          html += `<div class="detail-row"><span>Routes Over Mileage:</span> <strong style="color: ${diagnostics.overMileage > 0 ? '#f44336' : '#4CAF50'}">${diagnostics.overMileage}</strong></div>`;
+          html += `<div class="detail-row"><span>HOS Violations:</span> <strong style="color: ${diagnostics.hosViolations > 0 ? '#f44336' : '#4CAF50'}">${diagnostics.hosViolations}</strong></div>`;
+          html += '</div>';
+          
+          outputDiv.innerHTML = html;
+        })
+        .withFailureHandler((error) => {
+          outputDiv.innerHTML = '<div class="warning">Error: ' + error + '</div>';
+        })
+        .getPlanDiagnostics();
+    }
+
     // Load routes when sidebar opens
-    window.onload = loadRoutes;
+    window.onload = () => {
+      // Auto-load routes for the review tab when page loads
+      // This will be triggered when user switches to review tab
+    };
   </script>
 </body>
 </html>
